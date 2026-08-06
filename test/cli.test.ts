@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildExternalWaitLabelArgs,
   buildResumePrompt,
+  EXTERNAL_WAIT_ID_LABEL,
   normalizeState,
+  parsePaseoAgentStatus,
   parseSacct,
   parseSentinel,
   validateJobId,
@@ -60,4 +63,32 @@ test("builds a self-contained resume prompt", () => {
   assert.match(prompt, /job 123/);
   assert.match(prompt, /state=FAILED/);
   assert.match(prompt, /Run the focused tests/);
+});
+
+test("builds shell-free Paseo label update arguments", () => {
+  assert.deepEqual(buildExternalWaitLabelArgs("agent-123", "wait-456"), [
+    "agent",
+    "update",
+    "agent-123",
+    "--label",
+    `${EXTERNAL_WAIT_ID_LABEL}=wait-456`,
+    "--json",
+  ]);
+});
+
+test("parses Paseo inspect output before resuming an agent", () => {
+  assert.deepEqual(
+    parsePaseoAgentStatus(
+      JSON.stringify({
+        Status: "idle",
+        Archived: false,
+        PendingPermissions: [{ id: "permission-1" }],
+      }),
+    ),
+    {
+      status: "idle",
+      archived: false,
+      pendingPermissionCount: 1,
+    },
+  );
 });

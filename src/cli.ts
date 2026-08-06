@@ -28,12 +28,19 @@ const TERMINAL_STATES = new Set([
   "DEADLINE",
   "REVOKED",
 ]);
+export const EXTERNAL_WAIT_ID_LABEL = "paseo.external-wait-id";
 
 export interface SlurmResult {
   state: string;
   exitCode: string;
   elapsed?: string;
   source: "sacct" | "sentinel";
+}
+
+export interface PaseoAgentStatus {
+  status: string;
+  archived: boolean;
+  pendingPermissionCount: number;
 }
 
 interface Registration {
@@ -237,10 +244,103 @@ function spawnWatcher(id: string): number {
   return child.pid;
 }
 
+export function buildExternalWaitLabelArgs(agentId: string, waitId: string): string[] {
+  return [
+    "agent",
+    "update",
+    agentId,
+    "--label",
+    `${EXTERNAL_WAIT_ID_LABEL}=${waitId}`,
+    "--json",
+  ];
+}
+
+export function parsePaseoAgentStatus(output: string): PaseoAgentStatus {
+  const parsed = JSON.parse(output) as Record<string, unknown>;
+  const status = parsed.Status ?? parsed.status;
+  const archived = parsed.Archived ?? parsed.archived;
+  const pendingPermissions = parsed.PendingPermissions ?? parsed.pendingPermissions;
+  if (typeof status !== "string") {
+    throw new Error("Paseo inspect response did not contain an agent status");
+  }
+  return {
+    status: status.toLowerCase(),
+    archived: archived === true,
+    pendingPermissionCount: Array.isArray(pendingPermissions) ? pendingPermissions.length : 0,
+  };
+}
+
+function queryPaseoAgentStatus(registration: Registration): PaseoAgentStatus {
+  const inspected = spawnSync(
+    registration.paseoBin,
+    ["inspect", registration.agentId, "--json"],
+    { encoding: "utf8", timeout: 30_000 },
+  );
+  if (inspected.error || inspected.status !== 0) {
+    throw new Error(
+      inspected.error?.message || inspected.stderr.trim() || `paseo exited ${inspected.status}`,
+    );
+  }
+  return parsePaseoAgentStatus(inspected.stdout);
+}
+
+async function waitForAgentToPark(registration: Registration): Promise<void> {
+  let previousDescription = "";
+  while (true) {
+    let agent: PaseoAgentStatus;
+    try {
+      agent = queryPaseoAgentStatus(registration);
+    } catch (error) {
+      appendLog(
+        registration.id,
+        `agent status check failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      await sleep(1_000);
+      continue;
+    }
+    if (agent.archived) {
+      throw new Error(`agent ${registration.agentId} is archived`);
+    }
+    if (
+      (agent.status === "idle" || agent.status === "error") &&
+      agent.pendingPermissionCount === 0
+    ) {
+      return;
+    }
+    const description = `status=${agent.status} pending_permissions=${agent.pendingPermissionCount}`;
+    if (description !== previousDescription) {
+      appendLog(registration.id, `waiting for agent to park: ${description}`);
+      previousDescription = description;
+    }
+    await sleep(1_000);
+  }
+}
+
+function updateExternalWaitLabel(registration: Registration, waitId: string): string | null {
+  const updated = spawnSync(
+    registration.paseoBin,
+    buildExternalWaitLabelArgs(registration.agentId, waitId),
+    { encoding: "utf8", timeout: 30_000 },
+  );
+  if (!updated.error && updated.status === 0) {
+    return null;
+  }
+  return updated.error?.message || updated.stderr.trim() || `paseo exited ${updated.status}`;
+}
+
 async function sendResume(registration: Registration, result: SlurmResult): Promise<void> {
   const prompt = buildResumePrompt(registration, result);
+  await waitForAgentToPark(registration);
   let lastError = "";
   for (let attempt = 1; attempt <= 10; attempt += 1) {
+    const clearError = updateExternalWaitLabel(registration, "");
+    if (clearError) {
+      lastError = `failed to clear external wait label: ${clearError}`;
+      appendLog(registration.id, `resume attempt ${attempt} failed: ${lastError}`);
+      if (attempt < 10) await sleep(10_000);
+      continue;
+    }
+
     const sent = spawnSync(
       registration.paseoBin,
       ["send", registration.agentId, "--prompt", prompt, "--no-wait"],
@@ -251,6 +351,10 @@ async function sendResume(registration: Registration, result: SlurmResult): Prom
       return;
     }
     lastError = sent.error?.message || sent.stderr.trim() || `paseo exited ${sent.status}`;
+    const restoreError = updateExternalWaitLabel(registration, registration.id);
+    if (restoreError) {
+      lastError = `${lastError}; failed to restore external wait label: ${restoreError}`;
+    }
     appendLog(registration.id, `resume attempt ${attempt} failed: ${lastError}`);
     if (attempt < 10) await sleep(10_000);
   }
@@ -322,10 +426,19 @@ function register(args: ParsedArgs): void {
     updatedAt: now,
     status: "registered",
   };
-  writeRegistration(registration);
-  registration.watcherPid = spawnWatcher(id);
-  registration.status = "watching";
-  writeRegistration(registration);
+  const labelError = updateExternalWaitLabel(registration, id);
+  if (labelError) {
+    throw new Error(`failed to register external wait with Paseo: ${labelError}`);
+  }
+  try {
+    writeRegistration(registration);
+    registration.watcherPid = spawnWatcher(id);
+    registration.status = "watching";
+    writeRegistration(registration);
+  } catch (error) {
+    updateExternalWaitLabel(registration, "");
+    throw error;
+  }
   console.log(
     `WAITING_SLURM registration_id=${id} job_id=${jobId} watcher_pid=${registration.watcherPid}`,
   );
@@ -369,6 +482,10 @@ function cancel(args: ParsedArgs): void {
   const registration = readRegistration(id);
   registration.status = "cancelled";
   writeRegistration(registration);
+  const labelError = updateExternalWaitLabel(registration, "");
+  if (labelError) {
+    throw new Error(`cancelled watcher but failed to clear external wait label: ${labelError}`);
+  }
   console.log(`cancelled=${id}`);
 }
 

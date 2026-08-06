@@ -37,8 +37,13 @@ paseo-slurm register \
 ```
 
 `register` starts a detached, non-AI watcher and immediately prints
-`WAITING_SLURM`. The calling agent should then end its run. On terminal state,
-the watcher executes:
+`WAITING_SLURM`. It first sets the agent's reserved
+`paseo.external-wait-id` label, so a compatible Paseo daemon keeps the original
+parent finish subscription open without notifying the parent. The calling
+agent should then end its run.
+
+On terminal state, the watcher waits until the agent has parked at an idle or
+error boundary with no pending permission, clears the label, and executes:
 
 ```bash
 paseo send "$PASEO_AGENT_ID" --prompt "<result and continuation>" --no-wait
@@ -60,12 +65,12 @@ State and logs are stored beneath
 `${XDG_STATE_HOME:-~/.local/state}/paseo-slurm`. `recover` restarts missing
 watchers after a login or machine restart.
 
-## Current limitation
+## Paseo compatibility
 
-Paseo currently considers an agent run finished when it returns
-`WAITING_SLURM`. The sidecar automatically resumes that agent, but it cannot
-suppress Paseo's initial parent finish notification. Eliminating that
-notification requires a native Paseo `waiting_external` lifecycle state.
+The sidecar works with Paseo 0.2.5 and newer for token-free waiting and
+automatic resume. Suppressing the intermediate parent notification additionally
+requires a Paseo daemon with `paseo.external-wait-id` finish deferral support.
+Older daemons ignore the label and retain their normal notification behavior.
 
 ## Safety
 
