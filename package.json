@@ -1,6 +1,6 @@
 {
   "name": "paseo-slurm",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "Token-free Slurm completion watcher that resumes Paseo agents",
   "type": "module",
   "bin": {
@@ -8,13 +8,16 @@
   },
   "files": [
     "dist",
+    "patches",
+    "scripts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "check": "npm run build && npm test"
+    "check": "npm run build && npm test",
+    "apply-paseo-external-wait": "bash ./scripts/apply-paseo-external-wait.sh"
   },
   "engines": {
     "node": ">=20"

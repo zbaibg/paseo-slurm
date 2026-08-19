@@ -1,0 +1,216 @@
+From local/main-external-wait-tmpdir Mon Sep 17 00:00:00 2001
+From: zbai29 <zbai29@wisc.edu>
+Date: Wed, 19 Aug 2026 16:40:00 -0500
+Subject: [PATCH] Add paseo send --system for external-wait resumes
+
+Incremental on top of the finish-deferral companion patch. Vanilla checkouts
+should apply external-wait-finish-deferral.patch instead (it already includes
+this).
+
+Rebased onto getpaseo/paseo v0.5.0-beta.2 plus finish deferral.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
+index 53f04bf30..0851a8062 100644
+--- a/docs/agent-lifecycle.md
++++ b/docs/agent-lifecycle.md
+@@ -80,6 +80,9 @@ The label marks an external controller's ownership; Paseo does not interpret the
+ the external system, group membership, or completion strategy. The controller must serialize its
+ state transitions and completion prompts. Errors and permission requests still notify the caller
+ immediately. Clearing the label while the child is idle does not itself complete the delegated task.
++External controllers should resume the child with `paseo send --system`; this uses the same hidden
++system-context path as child-to-parent finish notifications instead of adding a user-message bubble
++to the timeline.
+ Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
+ The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
+ A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.
+diff --git a/packages/cli/src/commands/agent/send.ts b/packages/cli/src/commands/agent/send.ts
+index 06249289b..39949f062 100644
+--- a/packages/cli/src/commands/agent/send.ts
++++ b/packages/cli/src/commands/agent/send.ts
+@@ -32,6 +32,7 @@ export interface AgentSendOptions extends CommandOptions {
+   image?: string[];
+   prompt?: string;
+   promptFile?: string;
++  system?: boolean;
+ }
+ 
+ export function addSendOptions(cmd: Command): Command {
+@@ -41,6 +42,7 @@ export function addSendOptions(cmd: Command): Command {
+     .argument("[prompt]", "The message to send")
+     .option("--prompt <text>", "Provide the message inline as a flag")
+     .option("--prompt-file <path>", "Read the message from a UTF-8 text file")
++    .option("--system", "Send as internal system context without a user-message bubble")
+     .option("--image <path>", "Attach image(s) to the message", collectMultiple, [])
+     .option("--no-wait", "Return immediately without waiting for completion");
+ }
+@@ -203,7 +205,7 @@ export async function runSendCommand(
+       options.image && options.image.length > 0 ? await readImageFiles(options.image) : undefined;
+ 
+     // Send the message
+-    await client.sendAgentMessage(agentIdArg, promptInput, { images });
++    await client.sendAgentMessage(agentIdArg, promptInput, { images, system: options.system });
+ 
+     // If --no-wait, return immediately
+     if (options.wait === false) {
+diff --git a/packages/client/src/daemon-client.ts b/packages/client/src/daemon-client.ts
+index 5e07dc1f2..5b5a01dd8 100644
+--- a/packages/client/src/daemon-client.ts
++++ b/packages/client/src/daemon-client.ts
+@@ -340,6 +340,7 @@ export interface DaemonClientTrace {
+ 
+ export interface SendMessageOptions {
+   messageId?: string;
++  system?: boolean;
+   activeTurnBehavior?: ActiveTurnBehavior;
+   images?: Array<{ data: string; mimeType: string }>;
+   attachments?: SendAgentMessageRequest["attachments"];
+@@ -3040,13 +3041,14 @@ export class DaemonClient {
+     options?: SendMessageOptions,
+   ): Promise<void> {
+     const requestId = this.createRequestId();
+-    const messageId = options?.messageId ?? crypto.randomUUID();
++    const messageId = options?.system ? undefined : (options?.messageId ?? crypto.randomUUID());
+     const message = SessionInboundMessageSchema.parse({
+       type: "send_agent_message_request",
+       requestId,
+       agentId,
+       text,
+       ...(messageId ? { messageId } : {}),
++      ...(options?.system ? { system: true } : {}),
+       ...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),
+       ...(options?.images ? { images: options.images } : {}),
+       ...(options?.attachments ? { attachments: options.attachments } : {}),
+diff --git a/packages/client/src/index.test.ts b/packages/client/src/index.test.ts
+index 6d6b2e826..f3e5b214e 100644
+--- a/packages/client/src/index.test.ts
++++ b/packages/client/src/index.test.ts
+@@ -558,6 +558,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
+   );
+   await sendPromise;
+ 
++  const systemSendPromise = agent.send("external work completed", { system: true });
++  const systemSendRequest = parseSentSessionMessage(ws.sent.at(-1));
++  expect(systemSendRequest).toMatchObject({
++    type: "send_agent_message_request",
++    agentId: "agent_sdk",
++    text: "external work completed",
++    system: true,
++  });
++  expect(systemSendRequest).not.toHaveProperty("messageId");
++  ws.message(
++    sessionMessage({
++      type: "send_agent_message_response",
++      payload: {
++        requestId: systemSendRequest.requestId,
++        agentId: "agent_sdk",
++        accepted: true,
++        error: null,
++      },
++    }),
++  );
++  await systemSendPromise;
++
+   const runPromise = agent.run("finish the task", {
+     messageId: "run-message-sdk",
+     timeoutMs: 30_000,
+diff --git a/packages/client/src/index.ts b/packages/client/src/index.ts
+index 6a308cd29..dae3c87f0 100644
+--- a/packages/client/src/index.ts
++++ b/packages/client/src/index.ts
+@@ -215,6 +215,7 @@ export interface PaseoAgentTimelineRefetchOptions {
+ 
+ export interface PaseoAgentSendOptions {
+   messageId?: string;
++  system?: boolean;
+   images?: Array<{ data: string; mimeType: string }>;
+   attachments?: SendAgentMessageRequest["attachments"];
+ }
+diff --git a/packages/protocol/src/messages.test.ts b/packages/protocol/src/messages.test.ts
+index 015164f70..fc13ed9d1 100644
+--- a/packages/protocol/src/messages.test.ts
++++ b/packages/protocol/src/messages.test.ts
+@@ -76,6 +76,22 @@ describe("project icon revision compatibility", () => {
+   });
+ });
+ 
++describe("agent system messages", () => {
++  test("accepts a system-injected agent message request", () => {
++    const parsed = SessionInboundMessageSchema.parse({
++      type: "send_agent_message_request",
++      requestId: "request-system-1",
++      agentId: "agent-1",
++      text: "External work completed.",
++      system: true,
++    });
++    expect(parsed).toMatchObject({
++      type: "send_agent_message_request",
++      system: true,
++    });
++  });
++});
++
+ describe("workspace descriptor message compatibility", () => {
+   test("old-shaped fetch_workspaces_response without project still parses", () => {
+     const parsed = SessionOutboundMessageSchema.parse(
+diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
+index dbceccd0a..3e544a10d 100644
+--- a/packages/protocol/src/messages.ts
++++ b/packages/protocol/src/messages.ts
+@@ -1201,6 +1201,7 @@ export const SendAgentMessageSchema = z.object({
+   agentId: z.string(),
+   text: z.string(),
+   messageId: z.string().optional(), // Client-provided ID for deduplication
++  system: z.boolean().optional(),
+   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
+   images: z.array(ImageAttachmentSchema).optional(),
+   attachments: AgentAttachmentsSchema,
+@@ -1354,6 +1355,7 @@ export const SendAgentMessageRequestSchema = z.object({
+   agentId: z.string(),
+   text: z.string(),
+   messageId: z.string().optional(), // Client-provided ID for deduplication
++  system: z.boolean().optional(),
+   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
+   images: z.array(ImageAttachmentSchema).optional(),
+   attachments: AgentAttachmentsSchema,
+diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
+index 014d3e727..f6173290c 100644
+--- a/packages/server/src/server/session.ts
++++ b/packages/server/src/server/session.ts
+@@ -41,6 +41,8 @@ import {
+ } from "./persistence-hooks.js";
+ import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
+ import {
++  formatSystemNotificationPrompt,
++  isSystemInjectedEnvelope,
+   sendPromptToAgent,
+   waitForAgentRunStartWithTimeout,
+   unarchiveAgentState,
+@@ -7173,11 +7175,15 @@ export class Session {
+     try {
+       const agentId = resolved.agentId;
+ 
+-      const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
++      const text =
++        msg.system && !isSystemInjectedEnvelope(msg.text)
++          ? formatSystemNotificationPrompt(msg.text)
++          : msg.text;
++      const prompt = buildAgentPrompt(text, msg.images, msg.attachments);
+       this.sessionLogger.trace(
+         {
+           agentId,
+-          messageId: msg.messageId,
++          messageId: msg.system ? undefined : msg.messageId,
+           activeTurnBehavior: msg.activeTurnBehavior,
+           textPrefix: msg.text.slice(0, 80),
+         },
+@@ -7190,7 +7196,7 @@ export class Session {
+           agentStorage: this.agentStorage,
+           agentId,
+           prompt,
+-          messageId: msg.messageId,
++          messageId: msg.system ? undefined : msg.messageId,
+           activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+           logger: this.sessionLogger,
+         });

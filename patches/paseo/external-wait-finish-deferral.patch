@@ -1,0 +1,390 @@
+From local/main-external-wait-tmpdir Mon Sep 17 00:00:00 2001
+From: zbai29 <zbai29@wisc.edu>
+Date: Wed, 19 Aug 2026 16:40:00 -0500
+Subject: [PATCH] External-wait finish deferral and hidden system send
+
+Keep the original caller subscription alive across externally resumed work,
+and let controllers resume with `paseo send --system` so the prompt uses the
+hidden <paseo-system> path instead of a user-message bubble.
+
+Rebased onto getpaseo/paseo v0.5.0-beta.2 (ccd991b3e). Does not include
+machine-local TMPDIR defaults.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
+index db9762cbe..0851a8062 100644
+--- a/docs/agent-lifecycle.md
++++ b/docs/agent-lifecycle.md
+@@ -61,6 +61,28 @@ Runtime ownership is resolved from explicit workspace ID and caller context, nev
+ Users can also detach an existing subagent from the subagents track. Detach is deliberately a manual lifecycle gesture, not an agent-facing MCP tool. It removes the parent and open-tab lifecycle labels: it does not stop, archive, move, or restart the agent. The agent keeps its current `cwd` and `workspaceId`, leaves the former parent's track, and behaves like a root agent for tab close, workspace activity, and future parent archive.
+ 
+ `notifyOnFinish` defaults to `true` for agent-scoped creation and background prompt follow-ups because most delegated work needs to report back to the creating agent. Set it to `false` only for truly fire-and-forget agents or prompts.
++
++### External waits
++
++A child can defer its existing finish notification while work continues outside its provider runtime.
++Set the reserved `paseo.external-wait-id` label to a non-empty wait identifier before the turn
++becomes idle. The caller's finish subscription stays active, but that idle edge does not notify the
++caller.
++
++One identifier may represent a group of external operations. For an `each` controller, keep the same
++label while sending intermediate completion prompts; every resumed turn may become idle without
++notifying the caller. Clear the label before sending the group's final completion prompt. The final
++resumed turn's next idle edge notifies the original caller unless the child registered another
++external wait. An `all` controller simply keeps the label until every operation is terminal and then
++sends one final prompt.
++
++The label marks an external controller's ownership; Paseo does not interpret the identifier or poll
++the external system, group membership, or completion strategy. The controller must serialize its
++state transitions and completion prompts. Errors and permission requests still notify the caller
++immediately. Clearing the label while the child is idle does not itself complete the delegated task.
++External controllers should resume the child with `paseo send --system`; this uses the same hidden
++system-context path as child-to-parent finish notifications instead of adding a user-message bubble
++to the timeline.
+ Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
+ The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
+ A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.
+diff --git a/packages/cli/src/commands/agent/send.ts b/packages/cli/src/commands/agent/send.ts
+index 06249289b..39949f062 100644
+--- a/packages/cli/src/commands/agent/send.ts
++++ b/packages/cli/src/commands/agent/send.ts
+@@ -32,6 +32,7 @@ export interface AgentSendOptions extends CommandOptions {
+   image?: string[];
+   prompt?: string;
+   promptFile?: string;
++  system?: boolean;
+ }
+ 
+ export function addSendOptions(cmd: Command): Command {
+@@ -41,6 +42,7 @@ export function addSendOptions(cmd: Command): Command {
+     .argument("[prompt]", "The message to send")
+     .option("--prompt <text>", "Provide the message inline as a flag")
+     .option("--prompt-file <path>", "Read the message from a UTF-8 text file")
++    .option("--system", "Send as internal system context without a user-message bubble")
+     .option("--image <path>", "Attach image(s) to the message", collectMultiple, [])
+     .option("--no-wait", "Return immediately without waiting for completion");
+ }
+@@ -203,7 +205,7 @@ export async function runSendCommand(
+       options.image && options.image.length > 0 ? await readImageFiles(options.image) : undefined;
+ 
+     // Send the message
+-    await client.sendAgentMessage(agentIdArg, promptInput, { images });
++    await client.sendAgentMessage(agentIdArg, promptInput, { images, system: options.system });
+ 
+     // If --no-wait, return immediately
+     if (options.wait === false) {
+diff --git a/packages/client/src/daemon-client.ts b/packages/client/src/daemon-client.ts
+index 5e07dc1f2..5b5a01dd8 100644
+--- a/packages/client/src/daemon-client.ts
++++ b/packages/client/src/daemon-client.ts
+@@ -340,6 +340,7 @@ export interface DaemonClientTrace {
+ 
+ export interface SendMessageOptions {
+   messageId?: string;
++  system?: boolean;
+   activeTurnBehavior?: ActiveTurnBehavior;
+   images?: Array<{ data: string; mimeType: string }>;
+   attachments?: SendAgentMessageRequest["attachments"];
+@@ -3040,13 +3041,14 @@ export class DaemonClient {
+     options?: SendMessageOptions,
+   ): Promise<void> {
+     const requestId = this.createRequestId();
+-    const messageId = options?.messageId ?? crypto.randomUUID();
++    const messageId = options?.system ? undefined : (options?.messageId ?? crypto.randomUUID());
+     const message = SessionInboundMessageSchema.parse({
+       type: "send_agent_message_request",
+       requestId,
+       agentId,
+       text,
+       ...(messageId ? { messageId } : {}),
++      ...(options?.system ? { system: true } : {}),
+       ...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),
+       ...(options?.images ? { images: options.images } : {}),
+       ...(options?.attachments ? { attachments: options.attachments } : {}),
+diff --git a/packages/client/src/index.test.ts b/packages/client/src/index.test.ts
+index 6d6b2e826..f3e5b214e 100644
+--- a/packages/client/src/index.test.ts
++++ b/packages/client/src/index.test.ts
+@@ -558,6 +558,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
+   );
+   await sendPromise;
+ 
++  const systemSendPromise = agent.send("external work completed", { system: true });
++  const systemSendRequest = parseSentSessionMessage(ws.sent.at(-1));
++  expect(systemSendRequest).toMatchObject({
++    type: "send_agent_message_request",
++    agentId: "agent_sdk",
++    text: "external work completed",
++    system: true,
++  });
++  expect(systemSendRequest).not.toHaveProperty("messageId");
++  ws.message(
++    sessionMessage({
++      type: "send_agent_message_response",
++      payload: {
++        requestId: systemSendRequest.requestId,
++        agentId: "agent_sdk",
++        accepted: true,
++        error: null,
++      },
++    }),
++  );
++  await systemSendPromise;
++
+   const runPromise = agent.run("finish the task", {
+     messageId: "run-message-sdk",
+     timeoutMs: 30_000,
+diff --git a/packages/client/src/index.ts b/packages/client/src/index.ts
+index 6a308cd29..dae3c87f0 100644
+--- a/packages/client/src/index.ts
++++ b/packages/client/src/index.ts
+@@ -215,6 +215,7 @@ export interface PaseoAgentTimelineRefetchOptions {
+ 
+ export interface PaseoAgentSendOptions {
+   messageId?: string;
++  system?: boolean;
+   images?: Array<{ data: string; mimeType: string }>;
+   attachments?: SendAgentMessageRequest["attachments"];
+ }
+diff --git a/packages/protocol/src/agent-labels.test.ts b/packages/protocol/src/agent-labels.test.ts
+index 1f52a652f..8a0bd2178 100644
+--- a/packages/protocol/src/agent-labels.test.ts
++++ b/packages/protocol/src/agent-labels.test.ts
+@@ -1,5 +1,7 @@
+ import { describe, expect, test } from "vitest";
+ import {
++  EXTERNAL_WAIT_ID_LABEL,
++  getExternalWaitIdFromLabels,
+   getParentAgentIdFromLabels,
+   getOpenAgentTabLabel,
+   hasOpenAgentTab,
+@@ -36,4 +38,12 @@ describe("agent label policy", () => {
+     expect(isOpenAgentTabLabel("paseo.open-agent-tab")).toBe(false);
+     expect(isOpenAgentTabLabel("custom.open-agent-tab.client-a")).toBe(false);
+   });
++
++  test("reads only non-empty external wait identifiers", () => {
++    expect(getExternalWaitIdFromLabels({ [EXTERNAL_WAIT_ID_LABEL]: " wait-123 " })).toBe(
++      "wait-123",
++    );
++    expect(getExternalWaitIdFromLabels({ [EXTERNAL_WAIT_ID_LABEL]: "" })).toBeNull();
++    expect(getExternalWaitIdFromLabels({ [EXTERNAL_WAIT_ID_LABEL]: 42 })).toBeNull();
++  });
+ });
+diff --git a/packages/protocol/src/agent-labels.ts b/packages/protocol/src/agent-labels.ts
+index 2bf05950d..1adb935a4 100644
+--- a/packages/protocol/src/agent-labels.ts
++++ b/packages/protocol/src/agent-labels.ts
+@@ -1,4 +1,5 @@
+ export const PARENT_AGENT_ID_LABEL = "paseo.parent-agent-id";
++export const EXTERNAL_WAIT_ID_LABEL = "paseo.external-wait-id";
+ const OPEN_AGENT_TAB_LABEL_PREFIX = "paseo.open-agent-tab.";
+ 
+ export function getOpenAgentTabLabel(clientId: string): string {
+@@ -20,6 +21,11 @@ export function getParentAgentIdFromLabels(labels: Record<string, unknown> | nul
+     : null;
+ }
+ 
++export function getExternalWaitIdFromLabels(labels: Record<string, unknown> | null | undefined) {
++  const waitId = labels?.[EXTERNAL_WAIT_ID_LABEL];
++  return typeof waitId === "string" && waitId.trim().length > 0 ? waitId.trim() : null;
++}
++
+ export function isDelegatedAgent(agent: AgentLabelSource): boolean {
+   return getParentAgentIdFromLabels(agent.labels) !== null;
+ }
+diff --git a/packages/protocol/src/messages.test.ts b/packages/protocol/src/messages.test.ts
+index 015164f70..fc13ed9d1 100644
+--- a/packages/protocol/src/messages.test.ts
++++ b/packages/protocol/src/messages.test.ts
+@@ -76,6 +76,22 @@ describe("project icon revision compatibility", () => {
+   });
+ });
+ 
++describe("agent system messages", () => {
++  test("accepts a system-injected agent message request", () => {
++    const parsed = SessionInboundMessageSchema.parse({
++      type: "send_agent_message_request",
++      requestId: "request-system-1",
++      agentId: "agent-1",
++      text: "External work completed.",
++      system: true,
++    });
++    expect(parsed).toMatchObject({
++      type: "send_agent_message_request",
++      system: true,
++    });
++  });
++});
++
+ describe("workspace descriptor message compatibility", () => {
+   test("old-shaped fetch_workspaces_response without project still parses", () => {
+     const parsed = SessionOutboundMessageSchema.parse(
+diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
+index dbceccd0a..3e544a10d 100644
+--- a/packages/protocol/src/messages.ts
++++ b/packages/protocol/src/messages.ts
+@@ -1201,6 +1201,7 @@ export const SendAgentMessageSchema = z.object({
+   agentId: z.string(),
+   text: z.string(),
+   messageId: z.string().optional(), // Client-provided ID for deduplication
++  system: z.boolean().optional(),
+   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
+   images: z.array(ImageAttachmentSchema).optional(),
+   attachments: AgentAttachmentsSchema,
+@@ -1354,6 +1355,7 @@ export const SendAgentMessageRequestSchema = z.object({
+   agentId: z.string(),
+   text: z.string(),
+   messageId: z.string().optional(), // Client-provided ID for deduplication
++  system: z.boolean().optional(),
+   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
+   images: z.array(ImageAttachmentSchema).optional(),
+   attachments: AgentAttachmentsSchema,
+diff --git a/packages/server/src/server/agent/agent-prompt.test.ts b/packages/server/src/server/agent/agent-prompt.test.ts
+index 89b175d13..f3ded2614 100644
+--- a/packages/server/src/server/agent/agent-prompt.test.ts
++++ b/packages/server/src/server/agent/agent-prompt.test.ts
+@@ -1,5 +1,6 @@
+ import { expect, it, test, vi } from "vitest";
+ import pino, { type Logger } from "pino";
++import { EXTERNAL_WAIT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+ 
+ import { createTestLogger } from "../../test-utils/test-logger.js";
+ import { AgentManager } from "./agent-manager.js";
+@@ -45,6 +46,7 @@ interface FinishNotificationScenarioOptions {
+ 
+ interface FinishNotificationScenario {
+   startWatchingChild(): void;
++  setExternalWaitId(waitId: string | null): void;
+   requestChildPermission(requestId?: string): void;
+   resolveChildPermission(requestId?: string): void;
+   resolveChildPermissionFromState(requestId?: string): void;
+@@ -70,6 +72,7 @@ function createFinishNotificationScenario(
+   Reflect.set(childAgent, "id", "child-agent");
+   Reflect.set(childAgent, "lifecycle", "idle");
+   Reflect.set(childAgent, "config", { title: "Child Agent" });
++  Reflect.set(childAgent, "labels", {});
+   Reflect.set(childAgent, "pendingPermissions", new Map());
+ 
+   const callerAgent: ManagedAgent = Object.create(null);
+@@ -127,6 +130,13 @@ function createFinishNotificationScenario(
+   });
+ 
+   return {
++    setExternalWaitId(waitId) {
++      childAgent.labels = waitId ? { [EXTERNAL_WAIT_ID_LABEL]: waitId } : {};
++      subscriber?.({
++        type: "agent_state",
++        agent: childAgent,
++      });
++    },
+     startWatchingChild() {
+       setupFinishNotification({
+         agentManager,
+@@ -398,6 +408,38 @@ test("finish notifications survive repeated permission cycles", async () => {
+   ).toEqual(["needs permission", "needs permission", "finished"]);
+ });
+ 
++test("finish notifications stay deferred across an external wait and resumed turn", async () => {
++  const scenario = createFinishNotificationScenario();
++
++  scenario.startWatchingChild();
++  scenario.setExternalWaitId("slurm-1160646");
++  scenario.finishChild();
++  await new Promise((resolve) => setTimeout(resolve, 0));
++  expect(scenario.wasParentPrompted()).toBe(false);
++
++  scenario.setExternalWaitId(null);
++  await new Promise((resolve) => setTimeout(resolve, 0));
++  expect(scenario.wasParentPrompted()).toBe(false);
++
++  const parentPrompt = await scenario.finishChildAndReadParentPrompt();
++  expect(parentPrompt).toContain("Agent child-agent (Child Agent) finished.");
++});
++
++test("finish notifications stay deferred across multiple each-mode continuation turns", async () => {
++  const scenario = createFinishNotificationScenario();
++
++  scenario.startWatchingChild();
++  scenario.setExternalWaitId("slurm-group-1");
++  scenario.finishChild();
++  scenario.finishChild();
++  await new Promise((resolve) => setTimeout(resolve, 0));
++  expect(scenario.wasParentPrompted()).toBe(false);
++
++  scenario.setExternalWaitId(null);
++  const parentPrompt = await scenario.finishChildAndReadParentPrompt();
++  expect(parentPrompt).toContain("Agent child-agent (Child Agent) finished.");
++});
++
+ test("detaching a child ends its parent-owned finish notification", async () => {
+   const scenario = createFinishNotificationScenario({
+     childParentAgentId: null,
+diff --git a/packages/server/src/server/agent/agent-prompt.ts b/packages/server/src/server/agent/agent-prompt.ts
+index 05650efd1..069669886 100644
+--- a/packages/server/src/server/agent/agent-prompt.ts
++++ b/packages/server/src/server/agent/agent-prompt.ts
+@@ -8,7 +8,10 @@ import type {
+ import type { AgentManager, ManagedAgent } from "./agent-manager.js";
+ import type { AgentStorage } from "./agent-storage.js";
+ import { ensureAgentLoaded } from "./agent-loading.js";
+-import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
++import {
++  getExternalWaitIdFromLabels,
++  getParentAgentIdFromLabels,
++} from "@getpaseo/protocol/agent-labels";
+ import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
+ 
+ export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
+@@ -444,6 +447,10 @@ export function setupFinishNotification(params: SetupFinishNotificationParams):
+           return;
+         }
+         if (event.agent.lifecycle === "idle" && hasSeenRunning) {
++          if (getExternalWaitIdFromLabels(event.agent.labels)) {
++            hasSeenRunning = false;
++            return;
++          }
+           notifySafely("finished");
+           return;
+         }
+diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
+index 014d3e727..f6173290c 100644
+--- a/packages/server/src/server/session.ts
++++ b/packages/server/src/server/session.ts
+@@ -41,6 +41,8 @@ import {
+ } from "./persistence-hooks.js";
+ import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
+ import {
++  formatSystemNotificationPrompt,
++  isSystemInjectedEnvelope,
+   sendPromptToAgent,
+   waitForAgentRunStartWithTimeout,
+   unarchiveAgentState,
+@@ -7173,11 +7175,15 @@ export class Session {
+     try {
+       const agentId = resolved.agentId;
+ 
+-      const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
++      const text =
++        msg.system && !isSystemInjectedEnvelope(msg.text)
++          ? formatSystemNotificationPrompt(msg.text)
++          : msg.text;
++      const prompt = buildAgentPrompt(text, msg.images, msg.attachments);
+       this.sessionLogger.trace(
+         {
+           agentId,
+-          messageId: msg.messageId,
++          messageId: msg.system ? undefined : msg.messageId,
+           activeTurnBehavior: msg.activeTurnBehavior,
+           textPrefix: msg.text.slice(0, 80),
+         },
+@@ -7190,7 +7196,7 @@ export class Session {
+           agentStorage: this.agentStorage,
+           agentId,
+           prompt,
+-          messageId: msg.messageId,
++          messageId: msg.system ? undefined : msg.messageId,
+           activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+           logger: this.sessionLogger,
+         });
