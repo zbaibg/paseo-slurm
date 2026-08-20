@@ -109,6 +109,9 @@ or delete the patch, not force-apply.
 ## Patch notes
 
 See [README.md](./README.md) in this directory for what each patch does.
+`codex-reload-close-before-resume.patch` is [#3574](https://github.com/getpaseo/paseo/pull/3574):
+close the previous Codex writer before `thread/resume`; if replacement setup
+fails, keep the agent in `error` rather than closing it.
 `codex-rewind-runtime-mcp.patch` is the #3205 rewind/`thread/fork` fix and is
 applied. Do not apply a resume-MCP rebind for #3283; Codex 0.148 already honors
 the overlay Paseo sends on `thread/resume` after daemon restart.

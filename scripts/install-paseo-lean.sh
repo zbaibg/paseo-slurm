@@ -191,6 +191,7 @@ for dirpath, dirnames, filenames in os.walk(root):
         hits["codex_reload"] = (
             "Closing previous session before reload resume" in text
             and "finalizeFailedReload" in text
+            and "providerSessionClosed" in text
         )
     if "rewind.js" in filenames and dirpath.replace("\\", "/").endswith("/providers/codex"):
         text = open(os.path.join(dirpath, "rewind.js"), encoding="utf-8").read()

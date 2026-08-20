@@ -45,10 +45,10 @@ These patches do **not** include machine-local defaults such as
    resume attempts fail on stock stable CLI (`0.4.0`).
 3. Close the previous Codex app-server **before** spawning a replacement and
    calling `thread/resume`. Reload used to start the new writer first, so a
-   second reload hit Codex's exclusive-writer lock
-   (`already has an active writer`). If resume/MCP setup then fails, persist a
-   closed snapshot instead of leaving an idle agent on a dead session
-   ([#3574](https://github.com/getpaseo/paseo/pull/3574)). Independent of #3011.
+   live Codex agent failed reload with `already has an active writer`
+   ([#3574](https://github.com/getpaseo/paseo/pull/3574)). If resume/MCP setup
+   then fails, keep the agent visible in `error` and block `startTurn` until a
+   later reload succeeds. Independent of #3011.
 4. Pass the current runtime `buildCodexInnerConfig()` result (injected Paseo
    MCP endpoint, developer instructions) on Codex `thread/fork` during
    **Rewind conversation**. Without this, the forked thread stays loaded and
@@ -87,8 +87,9 @@ ships `paseo send --system`) merges into a stable release, drop the
 external-wait patches.
 
 Drop `codex-reload-close-before-resume.patch` when upstream reload closes the
-previous Codex app-server before `thread/resume` and closes the durable agent
-if replacement setup fails ([#3574](https://github.com/getpaseo/paseo/pull/3574)).
+previous Codex app-server before `thread/resume` and parks a failed
+replacement as a visible `error` agent
+([#3574](https://github.com/getpaseo/paseo/pull/3574)).
 
 Drop `codex-rewind-runtime-mcp.patch` when upstream rewind passes runtime
 `buildCodexInnerConfig()` on `thread/fork` ([#3205](https://github.com/getpaseo/paseo/issues/3205)).

@@ -135,7 +135,7 @@ equivalent that also ships `paseo send --system`) lands, this repo vendors:
 - `scripts/install-paseo-lean.sh` (latest stable tag + `--check` + lean global install)
 - `scripts/tmpdir_paseo_restart.sh` (`TMPDIR=/home/zbai29/soft/tmp paseo daemon restart`)
 - notes: `patches/paseo/README.md` and `patches/paseo/install-and-patch.md`
-- `patches/paseo/codex-reload-close-before-resume.patch` (close old app-server before `thread/resume`)
+- `patches/paseo/codex-reload-close-before-resume.patch` (close old app-server before `thread/resume`; failed reload stays visible in `error`)
 - `patches/paseo/codex-rewind-runtime-mcp.patch` (pass runtime MCP on `thread/fork`)
 
 Do **not** `npm install` the full Paseo monorepo on scratch (React Native /
