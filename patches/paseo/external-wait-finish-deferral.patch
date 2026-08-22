@@ -1,19 +1,19 @@
 From local/main-external-wait-tmpdir Mon Sep 17 00:00:00 2001
 From: zbai29 <zbai29@wisc.edu>
-Date: Wed, 19 Aug 2026 16:40:00 -0500
+Date: Sat, 22 Aug 2026 16:00:00 -0500
 Subject: [PATCH] External-wait finish deferral and hidden system send
 
 Keep the original caller subscription alive across externally resumed work,
 and let controllers resume with `paseo send --system` so the prompt uses the
 hidden <paseo-system> path instead of a user-message bubble.
 
-Rebased onto getpaseo/paseo v0.5.0-beta.2 (ccd991b3e). Does not include
+Rebased onto getpaseo/paseo v0.5.0-beta.4 (f660fcf2e). Does not include
 machine-local TMPDIR defaults.
 
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
 diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
-index db9762cbe..0851a8062 100644
+index 7e3d0913c..04f4b3414 100644
 --- a/docs/agent-lifecycle.md
 +++ b/docs/agent-lifecycle.md
 @@ -61,6 +61,28 @@ Runtime ownership is resolved from explicit workspace ID and caller context, nev
@@ -222,7 +222,7 @@ index 015164f70..fc13ed9d1 100644
    test("old-shaped fetch_workspaces_response without project still parses", () => {
      const parsed = SessionOutboundMessageSchema.parse(
 diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
-index dbceccd0a..3e544a10d 100644
+index bcc9c5845..e0a225cc0 100644
 --- a/packages/protocol/src/messages.ts
 +++ b/packages/protocol/src/messages.ts
 @@ -1201,6 +1201,7 @@ export const SendAgentMessageSchema = z.object({
@@ -322,7 +322,7 @@ index 89b175d13..f3ded2614 100644
    const scenario = createFinishNotificationScenario({
      childParentAgentId: null,
 diff --git a/packages/server/src/server/agent/agent-prompt.ts b/packages/server/src/server/agent/agent-prompt.ts
-index 05650efd1..069669886 100644
+index 07c7b4f57..27c594fe1 100644
 --- a/packages/server/src/server/agent/agent-prompt.ts
 +++ b/packages/server/src/server/agent/agent-prompt.ts
 @@ -8,7 +8,10 @@ import type {
@@ -337,7 +337,7 @@ index 05650efd1..069669886 100644
  import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
  
  export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
-@@ -444,6 +447,10 @@ export function setupFinishNotification(params: SetupFinishNotificationParams):
+@@ -452,6 +455,10 @@ export function setupFinishNotification(params: SetupFinishNotificationParams):
            return;
          }
          if (event.agent.lifecycle === "idle" && hasSeenRunning) {
@@ -349,7 +349,7 @@ index 05650efd1..069669886 100644
            return;
          }
 diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
-index 014d3e727..f6173290c 100644
+index b0ebb7f24..b6c533e12 100644
 --- a/packages/server/src/server/session.ts
 +++ b/packages/server/src/server/session.ts
 @@ -41,6 +41,8 @@ import {
@@ -361,7 +361,7 @@ index 014d3e727..f6173290c 100644
    sendPromptToAgent,
    waitForAgentRunStartWithTimeout,
    unarchiveAgentState,
-@@ -7173,11 +7175,15 @@ export class Session {
+@@ -7176,11 +7178,15 @@ export class Session {
      try {
        const agentId = resolved.agentId;
  
@@ -379,12 +379,12 @@ index 014d3e727..f6173290c 100644
            activeTurnBehavior: msg.activeTurnBehavior,
            textPrefix: msg.text.slice(0, 80),
          },
-@@ -7190,7 +7196,7 @@ export class Session {
+@@ -7193,7 +7199,7 @@ export class Session {
            agentStorage: this.agentStorage,
            agentId,
            prompt,
 -          messageId: msg.messageId,
 +          messageId: msg.system ? undefined : msg.messageId,
            activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+           clearPendingPermissions: true,
            logger: this.sessionLogger,
-         });

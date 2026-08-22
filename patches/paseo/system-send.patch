@@ -7,7 +7,7 @@ Incremental on top of the finish-deferral companion patch. Vanilla checkouts
 should apply external-wait-finish-deferral.patch instead (it already includes
 this).
 
-Rebased onto getpaseo/paseo v0.5.0-beta.2 plus finish deferral.
+Rebased onto getpaseo/paseo v0.5.0-beta.4 plus finish deferral.
 
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
@@ -205,12 +205,13 @@ index 014d3e727..f6173290c 100644
            activeTurnBehavior: msg.activeTurnBehavior,
            textPrefix: msg.text.slice(0, 80),
          },
-@@ -7190,7 +7196,7 @@ export class Session {
+@@ -7190,8 +7196,8 @@ export class Session {
            agentStorage: this.agentStorage,
            agentId,
            prompt,
 -          messageId: msg.messageId,
 +          messageId: msg.system ? undefined : msg.messageId,
            activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+           clearPendingPermissions: true,
            logger: this.sessionLogger,
          });
