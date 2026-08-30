@@ -18,18 +18,15 @@ lands the same behavior.
 Do not vendor a resume-MCP rebind for [getpaseo/paseo#3283](https://github.com/getpaseo/paseo/issues/3283): after daemon restart the thread is unloaded, so Paseo already sends the runtime overlay on `thread/resume`. Codex 0.148 honors that. That path is distinct from rewind/`thread/fork` (#3205).
 
 These patches do **not** include machine-local defaults such as
-`TMPDIR=/home/zbai29/soft/tmp`. Set that at restart time:
-
-```bash
-./scripts/tmpdir_paseo_restart.sh
-```
+`TMPDIR=/home/zbai29/soft/tmp`. The compute launch script sets that. After
+install, **do not start Paseo on the login node**.
 
 **Install (do this, not a full monorepo `npm install` on scratch):**
 
 ```bash
 ./scripts/install-paseo-lean.sh --check-only
 ./scripts/install-paseo-lean.sh
-./scripts/tmpdir_paseo_restart.sh   # when ready; kills running agents
+sbatch ./scripts/paseo-compute.sbatch
 ```
 
 ## What they do
@@ -66,7 +63,7 @@ Preferred path (latest stable tag, patch `--check`, daemon packages only, global
 ```bash
 ./scripts/install-paseo-lean.sh --check-only
 ./scripts/install-paseo-lean.sh
-./scripts/tmpdir_paseo_restart.sh   # when ready; kills running agents
+sbatch ./scripts/paseo-compute.sbatch
 ```
 
 To patch an existing **source** checkout without installing (no `node_modules`

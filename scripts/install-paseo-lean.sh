@@ -37,7 +37,8 @@ Applies:
   codex-reload-close-before-resume.patch (close old Codex app-server before thread/resume)
   codex-rewind-runtime-mcp.patch (pass runtime MCP config on Codex rewind thread/fork)
 
-Does not run `paseo daemon restart`. Do that yourself after the CLI smoke test.
+Does not start or restart the daemon. After install, submit
+scripts/paseo-compute.sbatch; never start Paseo on the login node.
 Never `npm i -g @getpaseo/cli` from the registry: that overwrites this install.
 EOF
 }
@@ -263,5 +264,6 @@ verify_install
 
 echo
 echo "INSTALLED ${REF} $(git -C "${SRC}" rev-parse --short HEAD) from ${SRC}"
-echo "Daemon was NOT restarted. When ready: ./scripts/tmpdir_paseo_restart.sh"
+echo "Daemon was NOT started. Do not start Paseo locally."
+echo "When ready: sbatch ./scripts/paseo-compute.sbatch"
 echo "Do not run: npm i -g @getpaseo/cli"

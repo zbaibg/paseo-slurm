@@ -25,6 +25,23 @@ npm run build
 npm link
 ```
 
+After install, **do not start Paseo on the login node**. Do not run
+`paseo daemon start`, `paseo start`, `paseo daemon restart`, or
+`./scripts/tmpdir_paseo_restart.sh`. Those talk to `127.0.0.1:6767` on
+kestrel and will fight the compute-node daemon for the same `~/.paseo`.
+
+Start the daemon only by submitting the compute-node job from the login node:
+
+```bash
+sbatch /home/zbai29/soft/paseo-slurm/scripts/paseo-compute.sbatch
+```
+
+The batch script refuses to run on kestrel. Watchers spawned by `paseo-slurm`
+must stay on the same compute node as that daemon so `paseo send` can resume
+agents. After a patched Paseo install, load the new server the same way:
+stop any leftover login-node daemon, then submit this script again (cancel the
+previous `paseo-daemon` job first if one is still running).
+
 ## Submit and wait
 
 `submit` creates or reuses the current agent's group, generates a shell wrapper
@@ -113,8 +130,9 @@ paseo-slurm cancel REGISTRATION_ID
 ```
 
 Group state, registration state, and logs are stored beneath
-`${XDG_STATE_HOME:-~/.local/state}/paseo-slurm`. `recover` restarts missing
-watchers after a login or machine restart.
+`${XDG_STATE_HOME:-~/.local/state}/paseo-slurm`. `recover` and `group wait`
+must run next to the compute-node daemon, not on kestrel. The compute launch
+script reattaches `watching` groups after the daemon is healthy.
 
 ## Paseo compatibility
 
@@ -133,7 +151,8 @@ equivalent that also ships `paseo send --system`) lands, this repo vendors:
 - `patches/paseo/system-send.patch` (incremental `--system` only)
 - `scripts/apply-paseo-external-wait.sh`
 - `scripts/install-paseo-lean.sh` (latest stable tag + `--check` + lean global install)
-- `scripts/tmpdir_paseo_restart.sh` (`TMPDIR=/home/zbai29/soft/tmp paseo daemon restart`)
+- `scripts/paseo-compute.sbatch` (compute-node daemon; do not start Paseo locally)
+- `scripts/tmpdir_paseo_restart.sh` (refuses local restart; prints the sbatch command)
 - notes: `patches/paseo/README.md` and `patches/paseo/install-and-patch.md`
 - `patches/paseo/codex-reload-close-before-resume.patch` (close old app-server before `thread/resume`; failed reload stays visible in `error`)
 - `patches/paseo/codex-rewind-runtime-mcp.patch` (pass runtime MCP on `thread/fork`)
@@ -144,13 +163,15 @@ website workspaces are ~150k inodes). Install like this:
 ```bash
 ./scripts/install-paseo-lean.sh --check-only
 ./scripts/install-paseo-lean.sh
-./scripts/tmpdir_paseo_restart.sh   # when ready; kills running agents
+sbatch ./scripts/paseo-compute.sbatch
 ```
 
 `--check-only` fetches the current stable `getpaseo/paseo` release tag and runs
 `git apply --check`. If that fails, regenerate the patches; do not force-apply.
-The installer never restarts the daemon. Never `npm i -g @getpaseo/cli` from the
-registry: that overwrites the patched packages.
+The installer never starts or restarts the daemon. After install, submit
+`scripts/paseo-compute.sbatch`; never start Paseo locally. Never
+`npm i -g @getpaseo/cli` from the registry: that overwrites the patched
+packages.
 
 ## Safety
 

@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# Restart the Paseo daemon with TMPDIR on durable scratch, not /tmp.
-# The companion patches do not bake in this machine-local default.
+# Local daemon restart is forbidden on this cluster.
+# After install, start Paseo only by submitting the compute-node job.
 set -euo pipefail
 
-TMPDIR_PASEO="${1:-${PASEO_TMPDIR:-/home/zbai29/soft/tmp}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCH="${SCRIPT_DIR}/paseo-compute.sbatch"
 
 usage() {
-  cat <<'EOF'
-Usage: tmpdir_paseo_restart.sh [DIR]
+  cat <<EOF
+Usage: tmpdir_paseo_restart.sh
 
-Restart `paseo daemon` with TMPDIR (and TMP/TEMP) set to DIR.
-Default: /home/zbai29/soft/tmp
+This helper no longer restarts Paseo on the login node.
 
-This kills running agents. The companion patches do not include TMPDIR;
-set it at restart time instead of patching Paseo source.
+After install, do not run:
+  paseo daemon start
+  paseo start
+  paseo daemon restart
 
-  PASEO_TMPDIR   override default directory when no argument is given
+Start or reload the daemon by submitting:
+
+  sbatch ${LAUNCH}
+
+Cancel an existing paseo-daemon Slurm job first if one is still running.
+The compute launch script sets TMPDIR=/home/zbai29/soft/tmp itself.
 EOF
 }
 
@@ -24,18 +31,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-if ! command -v paseo >/dev/null 2>&1; then
-  echo "error: paseo not on PATH" >&2
-  exit 1
-fi
-
-mkdir -p "${TMPDIR_PASEO}"
-export TMPDIR="${TMPDIR_PASEO}"
-export TMP="${TMPDIR_PASEO}"
-export TEMP="${TMPDIR_PASEO}"
-
-echo "TMPDIR=${TMPDIR}"
-echo "paseo=$(command -v paseo)"
-echo "Restarting daemon (this stops running agents)..."
-paseo daemon restart
-echo "OK  daemon restarted with TMPDIR=${TMPDIR}"
+echo "error: do not start or restart Paseo on the login node" >&2
+echo "error: after install, submit the compute-node job:" >&2
+echo "  sbatch ${LAUNCH}" >&2
+exit 1

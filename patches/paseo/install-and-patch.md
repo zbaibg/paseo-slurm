@@ -35,15 +35,17 @@ Default build tree: `/var/tmp/paseo-lean` (login-node disk, not CephFS).
 Override with `--src DIR` or `PASEO_LEAN_SRC`. Pin a tag with `--ref v0.4.0`
 or `PASEO_LEAN_REF`.
 
-Then, when you are ready to load the new server code, restart with a durable
-TMPDIR (the patches do **not** bake this in):
+Then load the new server **only** by submitting the compute-node job. Do not
+run `paseo daemon start` or `paseo daemon restart` on kestrel. The launch
+script sets `TMPDIR=/home/zbai29/soft/tmp` itself:
 
 ```bash
-./scripts/tmpdir_paseo_restart.sh
-# same as: TMPDIR=/home/zbai29/soft/tmp paseo daemon restart
+# cancel an existing paseo-daemon job first if one is still running
+sbatch ./scripts/paseo-compute.sbatch
 ```
 
-Restart kills running agents. Do not do it from an unattended worker.
+Submitting a replacement job stops the previous compute-node daemon and its
+agents. Do not do it from an unattended worker.
 
 ## What the installer does
 
