@@ -18,6 +18,15 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import {
+  assertExternalWaitOwnership,
+  claimExternalWait,
+  listExternalWaitClaims,
+  readExternalWaitClaim,
+  releaseExternalWaitClaim,
+  withExternalWaitTransition,
+  type ExternalWaitRef,
+} from "./external-wait-claim.js";
 
 const TERMINAL_STATES = new Set([
   "COMPLETED",
@@ -58,8 +67,21 @@ interface Registration {
   paseoBin: string;
   createdAt: string;
   updatedAt: string;
-  status: "registered" | "watching" | "terminal" | "resumed" | "resume_failed" | "cancelled";
+  status:
+    | "preparing"
+    | "registered"
+    | "watching"
+    | "terminal"
+    | "finalizing"
+    | "resumed"
+    | "resume_failed"
+    | "cancelling"
+    | "cancelled"
+    | "abandoned";
+  claimGeneration?: string;
+  controllerGeneration?: string;
   watcherPid?: number;
+  watcherStart?: string;
   result?: SlurmResult;
   error?: string;
 }
@@ -75,6 +97,12 @@ export interface WaitGroupItem {
   result?: SlurmResult;
 }
 
+export interface WaitGroupSubmission {
+  token: string;
+  scriptPath: string;
+  createdAt: string;
+}
+
 export interface WaitGroup {
   id: string;
   agentId: string;
@@ -84,9 +112,23 @@ export interface WaitGroup {
   paseoBin: string;
   createdAt: string;
   updatedAt: string;
-  status: "open" | "watching" | "completed" | "resume_failed" | "cancelled";
+  status:
+    | "preparing"
+    | "open"
+    | "watching"
+    | "finalizing"
+    | "completed"
+    | "resume_failed"
+    | "callback_ambiguous"
+    | "cancelling"
+    | "cancelled"
+    | "abandoned";
   items: WaitGroupItem[];
+  pendingSubmissions?: WaitGroupSubmission[];
+  claimGeneration?: string;
+  controllerGeneration?: string;
   watcherPid?: number;
+  watcherStart?: string;
   error?: string;
 }
 
@@ -171,13 +213,6 @@ function writeGroup(group: WaitGroup): void {
   renameSync(temporary, path);
 }
 
-function mutateGroup(id: string, mutate: (group: WaitGroup) => void): WaitGroup {
-  const group = readGroup(id);
-  mutate(group);
-  writeGroup(group);
-  return group;
-}
-
 function activeGroupForAgent(agentId: string): WaitGroup | undefined {
   ensureStateDirs();
   return readdirSync(groupsDir())
@@ -186,69 +221,81 @@ function activeGroupForAgent(agentId: string): WaitGroup | undefined {
     .find(
       (group) =>
         group.agentId === agentId &&
-        ["open", "watching", "resume_failed"].includes(group.status),
+        ["preparing", "open", "watching", "resume_failed", "callback_ambiguous", "finalizing", "cancelling"].includes(
+          group.status,
+        ),
     );
 }
 
-function activeRegistrationForAgent(agentId: string): Registration | undefined {
-  ensureStateDirs();
-  return readdirSync(registrationsDir())
-    .filter((name) => name.endsWith(".json"))
-    .map((name) => JSON.parse(readFileSync(join(registrationsDir(), name), "utf8")) as Registration)
-    .find(
-      (registration) =>
-        registration.agentId === agentId &&
-        ["registered", "watching", "terminal", "resume_failed"].includes(registration.status),
-    );
+function registrationRef(registration: Registration): ExternalWaitRef {
+  if (!registration.claimGeneration) {
+    throw new Error(`registration ${registration.id} has no external-wait generation`);
+  }
+  return {
+    agentId: registration.agentId,
+    waitId: registration.id,
+    kind: "slurm-registration",
+    generation: registration.claimGeneration,
+  };
 }
 
-function activeLocalWaitIdForAgent(agentId: string): string | undefined {
-  const directory = join(dirname(stateRoot()), "paseo-local", "tasks");
-  if (!existsSync(directory)) return undefined;
-  return readdirSync(directory)
-    .filter((name) => name.endsWith(".json"))
-    .map((name) => JSON.parse(readFileSync(join(directory, name), "utf8")) as {
-      id: string;
-      agentId: string;
-      status: string;
-    })
-    .find(
-      (task) =>
-        task.agentId === agentId &&
-        [
-          "starting",
-          "watching",
-          "terminal",
-          "resume_failed",
-          "cancel_requested",
-          "lost",
-        ].includes(task.status),
-    )?.id;
+function groupRef(group: WaitGroup): ExternalWaitRef {
+  if (!group.claimGeneration) {
+    throw new Error(`group ${group.id} has no external-wait generation`);
+  }
+  return {
+    agentId: group.agentId,
+    waitId: group.id,
+    kind: "slurm-group",
+    generation: group.claimGeneration,
+  };
 }
 
-function createGroupRecord(options: {
+function adoptRegistrationClaim(registration: Registration): Registration {
+  const claim = claimExternalWait({
+    agentId: registration.agentId,
+    waitId: registration.id,
+    kind: "slurm-registration",
+    generation: registration.claimGeneration,
+    allowExisting: true,
+  });
+  if (registration.claimGeneration && registration.claimGeneration !== claim.generation) {
+    throw new Error(`registration ${registration.id} belongs to a different claim generation`);
+  }
+  if (!registration.claimGeneration) {
+    registration.claimGeneration = claim.generation;
+    writeRegistration(registration);
+  }
+  assertExternalWaitOwnership(registrationRef(registration));
+  return registration;
+}
+
+function adoptGroupClaim(group: WaitGroup): WaitGroup {
+  const claim = claimExternalWait({
+    agentId: group.agentId,
+    waitId: group.id,
+    kind: "slurm-group",
+    generation: group.claimGeneration,
+    allowExisting: true,
+  });
+  if (group.claimGeneration && group.claimGeneration !== claim.generation) {
+    throw new Error(`group ${group.id} belongs to a different claim generation`);
+  }
+  if (!group.claimGeneration) {
+    group.claimGeneration = claim.generation;
+    writeGroup(group);
+  }
+  assertExternalWaitOwnership(groupRef(group));
+  return group;
+}
+
+function createGroupRecordLocked(options: {
   agentId: string;
   mode: WaitGroupMode;
   intervalSeconds: number;
   sentinelPollSeconds: number;
   paseoBin: string;
 }): WaitGroup {
-  const activeGroup = activeGroupForAgent(options.agentId);
-  if (activeGroup) {
-    throw new Error(`agent ${options.agentId} already owns active group ${activeGroup.id}`);
-  }
-  const activeRegistration = activeRegistrationForAgent(options.agentId);
-  if (activeRegistration) {
-    throw new Error(
-      `agent ${options.agentId} already owns active registration ${activeRegistration.id}; cancel or finish it before creating a group`,
-    );
-  }
-  const activeLocalWaitId = activeLocalWaitIdForAgent(options.agentId);
-  if (activeLocalWaitId) {
-    throw new Error(
-      `agent ${options.agentId} already owns active paseo-local task ${activeLocalWaitId}; finish it before creating a Slurm group`,
-    );
-  }
   const now = new Date().toISOString();
   const group: WaitGroup = {
     id: `${options.agentId.slice(0, 8)}-group-${Date.now()}`,
@@ -259,19 +306,26 @@ function createGroupRecord(options: {
     paseoBin: options.paseoBin,
     createdAt: now,
     updatedAt: now,
-    status: "open",
+    status: "preparing",
     items: [],
   };
-  const labelError = updateExternalWaitLabel(group, group.id);
+  const claim = claimExternalWait({
+    agentId: group.agentId,
+    waitId: group.id,
+    kind: "slurm-group",
+  });
+  maybeCrashAfterClaim("slurm-group");
+  group.claimGeneration = claim.generation;
+  writeGroup(group);
+  const labelError = updateExternalWaitLabelOwned(group, groupRef(group), group.id);
   if (labelError) {
+    group.error = `failed to set external-wait label: ${labelError}`;
+    writeGroup(group);
     throw new Error(`failed to create external wait group with Paseo: ${labelError}`);
   }
-  try {
-    writeGroup(group);
-  } catch (error) {
-    updateExternalWaitLabel(group, "");
-    throw error;
-  }
+  group.status = "open";
+  group.error = undefined;
+  writeGroup(group);
   return group;
 }
 
@@ -393,11 +447,23 @@ export function buildResumePrompt(registration: Pick<Registration, "jobId" | "re
 }
 
 export function selectGroupDispatch(
-  group: Pick<WaitGroup, "mode" | "items">,
+  group: Pick<WaitGroup, "mode" | "items"> & Pick<WaitGroup, "pendingSubmissions">,
 ): { items: WaitGroupItem[]; final: boolean } | undefined {
   const ready = group.items.filter((item) => item.status === "terminal" && item.result);
-  if (ready.length === 0) return undefined;
-  const hasPending = group.items.some((item) => item.status === "pending");
+  const hasPending =
+    group.items.some((item) => item.status === "pending") ||
+    (group.pendingSubmissions?.length ?? 0) > 0;
+  if (ready.length === 0) {
+    if (
+      group.mode === "each" &&
+      !hasPending &&
+      group.items.length > 0 &&
+      group.items.every((item) => item.status === "notified")
+    ) {
+      return { items: [], final: true };
+    }
+    return undefined;
+  }
   if (group.mode === "all" && hasPending) return undefined;
   return { items: ready, final: !hasPending };
 }
@@ -526,21 +592,72 @@ class SentinelWatcher {
   }
 }
 
-function isProcessAlive(pid: number | undefined): boolean {
+function processStartIdentity(pid: number | undefined): string | undefined {
+  if (!pid) return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    const fields = stat.slice(close + 2).split(/\s+/);
+    return fields[0] === "Z" ? undefined : fields[19];
+  } catch {
+    return undefined;
+  }
+}
+
+function isProcessAlive(pid: number | undefined, expectedStart?: string): boolean {
   if (!pid) return false;
   try {
     process.kill(pid, 0);
-    return true;
+    return !expectedStart || processStartIdentity(pid) === expectedStart;
   } catch {
     return false;
   }
 }
 
-function spawnWatcher(id: string): number {
+async function stopController(
+  pid: number | undefined,
+  expectedStart: string | undefined,
+): Promise<void> {
+  if (!pid || !expectedStart || processStartIdentity(pid) !== expectedStart) return;
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if (processStartIdentity(pid) !== expectedStart) return;
+    throw error;
+  }
+  const termDeadline = Date.now() + 2_000;
+  while (processStartIdentity(pid) === expectedStart && Date.now() < termDeadline) {
+    await sleep(20);
+  }
+  if (processStartIdentity(pid) !== expectedStart) return;
+  process.kill(pid, "SIGKILL");
+  const killDeadline = Date.now() + 2_000;
+  while (processStartIdentity(pid) === expectedStart && Date.now() < killDeadline) {
+    await sleep(20);
+  }
+  if (processStartIdentity(pid) === expectedStart) {
+    throw new Error(`controller pid ${pid} did not terminate after fencing`);
+  }
+}
+
+function maybeCrashAfterClaim(kind: string): void {
+  if (process.env.PASEO_EXTERNAL_WAIT_TEST_CRASH_AFTER_CLAIM === kind) process.exit(92);
+}
+
+function maybeCrashAfterFinalPersistence(kind: string): void {
+  if (process.env.PASEO_EXTERNAL_WAIT_TEST_CRASH_AFTER_FINAL_PERSIST === kind) process.exit(91);
+}
+
+function maybeCrashAfterGroupSend(final: boolean): void {
+  const phase = final ? "final" : "intermediate";
+  if (process.env.PASEO_EXTERNAL_WAIT_TEST_CRASH_AFTER_GROUP_SEND === phase) process.exit(90);
+}
+
+function spawnWatcher(id: string, controllerGeneration: string): number {
   ensureStateDirs();
   const script = fileURLToPath(import.meta.url);
   const output = openSync(logPath(id), "a");
-  const child = spawn(process.execPath, [script, "_watch", id], {
+  const child = spawn(process.execPath, [script, "_watch", id, controllerGeneration], {
     detached: true,
     stdio: ["ignore", output, output],
     env: process.env,
@@ -550,11 +667,11 @@ function spawnWatcher(id: string): number {
   return child.pid;
 }
 
-function spawnGroupWatcher(id: string): number {
+function spawnGroupWatcher(id: string, controllerGeneration: string): number {
   ensureStateDirs();
   const script = fileURLToPath(import.meta.url);
   const output = openSync(logPath(id), "a");
-  const child = spawn(process.execPath, [script, "_watch_group", id], {
+  const child = spawn(process.execPath, [script, "_watch_group", id, controllerGeneration], {
     detached: true,
     stdio: ["ignore", output, output],
     env: process.env,
@@ -562,6 +679,54 @@ function spawnGroupWatcher(id: string): number {
   child.unref();
   if (!child.pid) throw new Error("failed to start detached group watcher");
   return child.pid;
+}
+
+function ensureRegistrationControllerLocked(registration: Registration): Registration {
+  assertExternalWaitOwnership(registrationRef(registration));
+  if (
+    registration.controllerGeneration &&
+    isProcessAlive(registration.watcherPid, registration.watcherStart)
+  ) {
+    return registration;
+  }
+  if (["finalizing", "cancelling", "resumed", "cancelled", "abandoned"].includes(registration.status)) {
+    throw new Error(`cannot start a controller for ${registration.status} registration ${registration.id}`);
+  }
+  const controllerGeneration = randomUUID();
+  registration.controllerGeneration = controllerGeneration;
+  registration.watcherPid = undefined;
+  registration.watcherStart = undefined;
+  if (["registered", "watching", "resume_failed"].includes(registration.status)) {
+    registration.status = "registered";
+  }
+  writeRegistration(registration);
+  const watcherPid = spawnWatcher(registration.id, controllerGeneration);
+  registration.watcherPid = watcherPid;
+  registration.watcherStart = processStartIdentity(watcherPid);
+  writeRegistration(registration);
+  return registration;
+}
+
+function ensureGroupControllerLocked(group: WaitGroup): WaitGroup {
+  assertExternalWaitOwnership(groupRef(group));
+  if (group.controllerGeneration && isProcessAlive(group.watcherPid, group.watcherStart)) {
+    return group;
+  }
+  if (["callback_ambiguous", "finalizing", "cancelling", "completed", "cancelled", "abandoned"].includes(group.status)) {
+    throw new Error(`cannot start a controller for ${group.status} group ${group.id}`);
+  }
+  const controllerGeneration = randomUUID();
+  group.controllerGeneration = controllerGeneration;
+  group.watcherPid = undefined;
+  group.watcherStart = undefined;
+  group.status = "watching";
+  group.error = undefined;
+  writeGroup(group);
+  const watcherPid = spawnGroupWatcher(group.id, controllerGeneration);
+  group.watcherPid = watcherPid;
+  group.watcherStart = processStartIdentity(watcherPid);
+  writeGroup(group);
+  return group;
 }
 
 export function buildExternalWaitLabelArgs(agentId: string, waitId: string): string[] {
@@ -654,52 +819,136 @@ function updateExternalWaitLabel(owner: ExternalWaitOwner, waitId: string): stri
   return updated.error?.message || updated.stderr.trim() || `paseo exited ${updated.status}`;
 }
 
-async function sendResume(registration: Registration, result: SlurmResult): Promise<void> {
-  const prompt = buildResumePrompt(registration, result);
-  await waitForAgentToPark(registration);
-  let lastError = "";
-  for (let attempt = 1; attempt <= 10; attempt += 1) {
-    const clearError = updateExternalWaitLabel(registration, "");
-    if (clearError) {
-      lastError = `failed to clear external wait label: ${clearError}`;
-      appendLog(registration.id, `resume attempt ${attempt} failed: ${lastError}`);
-      if (attempt < 10) await sleep(10_000);
-      continue;
-    }
-
-    const sent = spawnSync(
-      registration.paseoBin,
-      ["send", registration.agentId, "--prompt", prompt, "--system", "--no-wait"],
-      { encoding: "utf8", timeout: 30_000 },
-    );
-    if (!sent.error && sent.status === 0) {
-      appendLog(registration.id, `resumed agent ${registration.agentId}`);
-      return;
-    }
-    lastError = sent.error?.message || sent.stderr.trim() || `paseo exited ${sent.status}`;
-    const restoreError = updateExternalWaitLabel(registration, registration.id);
-    if (restoreError) {
-      lastError = `${lastError}; failed to restore external wait label: ${restoreError}`;
-    }
-    appendLog(registration.id, `resume attempt ${attempt} failed: ${lastError}`);
-    if (attempt < 10) await sleep(10_000);
-  }
-  throw new Error(lastError);
+function updateExternalWaitLabelOwned(
+  owner: ExternalWaitOwner,
+  reference: ExternalWaitRef,
+  waitId: string,
+): string | null {
+  assertExternalWaitOwnership(reference);
+  const error = updateExternalWaitLabel(owner, waitId);
+  assertExternalWaitOwnership(reference);
+  return error;
 }
 
-async function watchRegistration(id: string): Promise<void> {
+function sendOwned(
+  owner: ExternalWaitOwner,
+  reference: ExternalWaitRef,
+  prompt: string,
+): string | null {
+  assertExternalWaitOwnership(reference);
+  const sent = spawnSync(
+    owner.paseoBin,
+    ["send", owner.agentId, "--prompt", prompt, "--system", "--no-wait"],
+    { encoding: "utf8", timeout: 30_000 },
+  );
+  assertExternalWaitOwnership(reference);
+  if (!sent.error && sent.status === 0) return null;
+  return sent.error?.message || sent.stderr.trim() || `paseo exited ${sent.status}`;
+}
+
+function assertRegistrationController(
+  registration: Registration,
+  controllerGeneration: string,
+): ExternalWaitRef {
+  const reference = registrationRef(registration);
+  assertExternalWaitOwnership(reference);
+  if (registration.controllerGeneration !== controllerGeneration) {
+    throw new Error(`registration ${registration.id} controller generation was fenced`);
+  }
+  return reference;
+}
+
+async function finalizeRegistration(
+  id: string,
+  controllerGeneration: string,
+): Promise<void> {
+  const parkedOwner = readRegistration(id);
+  await waitForAgentToPark(parkedOwner);
+  await withExternalWaitTransition(parkedOwner.agentId, async () => {
+    let registration = readRegistration(id);
+    let reference = assertRegistrationController(registration, controllerGeneration);
+    if (["cancelling", "cancelled", "abandoned", "resumed"].includes(registration.status)) return;
+    if (!registration.result || !["terminal", "resume_failed"].includes(registration.status)) {
+      throw new Error(`registration ${id} is not ready for terminal callback`);
+    }
+    registration.status = "finalizing";
+    registration.error = undefined;
+    writeRegistration(registration);
+
+    registration = readRegistration(id);
+    reference = assertRegistrationController(registration, controllerGeneration);
+    if (!registration.result) throw new Error(`registration ${id} lost its terminal result`);
+    const clearError = updateExternalWaitLabelOwned(registration, reference, "");
+    if (clearError) {
+      registration.status = "resume_failed";
+      registration.error = `failed to clear external wait label: ${clearError}`;
+      writeRegistration(registration);
+      throw new Error(registration.error);
+    }
+    const prompt = buildResumePrompt(registration, registration.result);
+    const sendError = sendOwned(registration, reference, prompt);
+    if (sendError) {
+      const restoreError = updateExternalWaitLabelOwned(registration, reference, registration.id);
+      registration = readRegistration(id);
+      assertRegistrationController(registration, controllerGeneration);
+      registration.status = "finalizing";
+      registration.error = restoreError
+        ? `${sendError}; failed to restore external wait label: ${restoreError}`
+        : `callback result is ambiguous after send failure: ${sendError}`;
+      writeRegistration(registration);
+      throw new Error(registration.error);
+    }
+
+    registration = readRegistration(id);
+    reference = assertRegistrationController(registration, controllerGeneration);
+    if (registration.status !== "finalizing") {
+      throw new Error(`registration ${id} left finalizing state before commit`);
+    }
+    registration.status = "resumed";
+    registration.error = undefined;
+    writeRegistration(registration);
+    assertExternalWaitOwnership(reference);
+    maybeCrashAfterFinalPersistence("slurm-registration");
+    releaseExternalWaitClaim(reference);
+    appendLog(id, `resumed agent ${registration.agentId}`);
+  });
+}
+
+async function watchRegistration(id: string, controllerGeneration: string): Promise<void> {
   let registration = readRegistration(id);
-  if (registration.status === "cancelled" || registration.status === "resumed") return;
-  registration.status = "watching";
-  registration.watcherPid = process.pid;
-  writeRegistration(registration);
-  appendLog(id, `watching job ${registration.jobId}`);
+  const started = await withExternalWaitTransition(registration.agentId, () => {
+    registration = readRegistration(id);
+    assertRegistrationController(registration, controllerGeneration);
+    if (["cancelling", "cancelled", "abandoned", "resumed", "finalizing"].includes(registration.status)) {
+      return false;
+    }
+    registration.watcherPid = process.pid;
+    registration.watcherStart = processStartIdentity(process.pid);
+    if (registration.status !== "terminal" && registration.status !== "resume_failed") {
+      registration.status = "watching";
+    }
+    writeRegistration(registration);
+    return true;
+  });
+  if (!started) return;
+  appendLog(id, `watching job ${registration.jobId} controller=${controllerGeneration}`);
+  if (registration.result && ["terminal", "resume_failed"].includes(registration.status)) {
+    try {
+      await finalizeRegistration(id, controllerGeneration);
+    } catch (error) {
+      appendLog(id, `terminal callback stopped: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   const sentinelWatcher = new SentinelWatcher();
   let nextSacctAt = Date.now() + registration.intervalSeconds * 1000;
   try {
     while (true) {
       registration = readRegistration(id);
-      if (registration.status === "cancelled") return;
+      if (["cancelling", "cancelled", "abandoned", "resumed", "finalizing"].includes(registration.status)) return;
+      if (registration.controllerGeneration !== controllerGeneration) return;
       sentinelWatcher.update([registration.sentinelPath]);
       const observedGeneration = sentinelWatcher.snapshot();
       try {
@@ -709,28 +958,27 @@ async function watchRegistration(id: string): Promise<void> {
           nextSacctAt = Date.now() + registration.intervalSeconds * 1000;
         }
         if (result) {
-          registration.status = "terminal";
-          registration.result = result;
-          writeRegistration(registration);
+          const accepted = await withExternalWaitTransition(registration.agentId, () => {
+            registration = readRegistration(id);
+            assertRegistrationController(registration, controllerGeneration);
+            if (!["registered", "watching"].includes(registration.status)) return false;
+            registration.status = "terminal";
+            registration.result = result;
+            writeRegistration(registration);
+            return true;
+          });
+          if (!accepted) return;
           appendLog(
             id,
             `terminal state ${result.state} exit=${result.exitCode} source=${result.source}`,
           );
           try {
-            await sendResume(registration, result);
-            registration = readRegistration(id);
-            registration.status = "resumed";
-            registration.error = undefined;
-            writeRegistration(registration);
-            return;
+            await finalizeRegistration(id, controllerGeneration);
           } catch (error) {
-            registration = readRegistration(id);
-            registration.status = "resume_failed";
-            registration.error = error instanceof Error ? error.message : String(error);
-            writeRegistration(registration);
+            appendLog(id, `terminal callback stopped: ${error instanceof Error ? error.message : String(error)}`);
             process.exitCode = 1;
-            return;
           }
+          return;
         }
       } catch (error) {
         appendLog(id, `status check failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -745,64 +993,143 @@ async function watchRegistration(id: string): Promise<void> {
   }
 }
 
-async function sendGroupResume(
-  group: WaitGroup,
-  items: WaitGroupItem[],
-  final: boolean,
-): Promise<void> {
-  const prompt = buildGroupResumePrompt(group, items, final);
-  let lastError = "";
-  for (let attempt = 1; attempt <= 10; attempt += 1) {
-    if (final) {
-      const clearError = updateExternalWaitLabel(group, "");
-      if (clearError) {
-        lastError = `failed to clear external wait label: ${clearError}`;
-        appendLog(group.id, `resume attempt ${attempt} failed: ${lastError}`);
-        if (attempt < 10) await sleep(10_000);
-        continue;
-      }
-    }
-
-    const sent = spawnSync(
-      group.paseoBin,
-      ["send", group.agentId, "--prompt", prompt, "--system", "--no-wait"],
-      { encoding: "utf8", timeout: 30_000 },
-    );
-    if (!sent.error && sent.status === 0) {
-      appendLog(
-        group.id,
-        `resumed agent ${group.agentId} jobs=${items.map((item) => item.jobId).join(",")} final=${final}`,
-      );
-      return;
-    }
-    lastError = sent.error?.message || sent.stderr.trim() || `paseo exited ${sent.status}`;
-    if (final) {
-      const restoreError = updateExternalWaitLabel(group, group.id);
-      if (restoreError) {
-        lastError = `${lastError}; failed to restore external wait label: ${restoreError}`;
-      }
-    }
-    appendLog(group.id, `resume attempt ${attempt} failed: ${lastError}`);
-    if (attempt < 10) await sleep(10_000);
+function assertGroupController(group: WaitGroup, controllerGeneration: string): ExternalWaitRef {
+  const reference = groupRef(group);
+  assertExternalWaitOwnership(reference);
+  if (group.controllerGeneration !== controllerGeneration) {
+    throw new Error(`group ${group.id} controller generation was fenced`);
   }
-  throw new Error(lastError);
+  return reference;
 }
 
-async function watchGroup(id: string): Promise<void> {
-  let group = mutateGroup(id, (current) => {
-    if (current.status !== "cancelled" && current.status !== "completed") {
-      current.status = "watching";
-      current.watcherPid = process.pid;
+async function finalizeGroupDispatch(
+  id: string,
+  controllerGeneration: string,
+): Promise<boolean> {
+  const parkedOwner = readGroup(id);
+  await waitForAgentToPark(parkedOwner);
+  return withExternalWaitTransition(parkedOwner.agentId, () => {
+    let group = readGroup(id);
+    let reference = assertGroupController(group, controllerGeneration);
+    if (["cancelling", "cancelled", "abandoned", "completed", "callback_ambiguous", "finalizing"].includes(group.status)) {
+      return group.status === "completed";
     }
+    let dispatch = selectGroupDispatch(group);
+    if (!dispatch) return false;
+    if (dispatch.final) {
+      group.status = "finalizing";
+      group.error = undefined;
+      writeGroup(group);
+      group = readGroup(id);
+      reference = assertGroupController(group, controllerGeneration);
+      dispatch = selectGroupDispatch(group);
+      if (
+        !dispatch?.final ||
+        group.items.some((item) => item.status === "pending") ||
+        (group.pendingSubmissions?.length ?? 0) > 0
+      ) {
+        group.status = "watching";
+        writeGroup(group);
+        return false;
+      }
+      const clearError = updateExternalWaitLabelOwned(group, reference, "");
+      if (clearError) {
+        group.status = "resume_failed";
+        group.error = `failed to clear external wait label: ${clearError}`;
+        writeGroup(group);
+        throw new Error(group.error);
+      }
+    } else {
+      // Persist the ambiguous boundary before the external send. If this
+      // controller dies after Paseo accepts the callback but before we record
+      // the notified items, recovery must stop instead of sending it twice.
+      group.status = "callback_ambiguous";
+      group.error = "intermediate callback is in flight; inspect before explicit abandon";
+      writeGroup(group);
+      group = readGroup(id);
+      reference = assertGroupController(group, controllerGeneration);
+    }
+
+    const prompt = buildGroupResumePrompt(group, dispatch.items, dispatch.final);
+    const sendError = sendOwned(group, reference, prompt);
+    if (sendError) {
+      let restoreError: string | null = null;
+      if (dispatch.final) {
+        restoreError = updateExternalWaitLabelOwned(group, reference, group.id);
+      }
+      group = readGroup(id);
+      assertGroupController(group, controllerGeneration);
+      group.status = dispatch.final ? "finalizing" : "callback_ambiguous";
+      group.error = restoreError
+        ? `${sendError}; failed to restore external wait label: ${restoreError}`
+        : `callback result is ambiguous after send failure: ${sendError}`;
+      writeGroup(group);
+      throw new Error(group.error);
+    }
+
+    maybeCrashAfterGroupSend(dispatch.final);
+
+    group = readGroup(id);
+    reference = assertGroupController(group, controllerGeneration);
+    const dispatchedJobIds = new Set(dispatch.items.map((item) => item.jobId));
+    for (const item of group.items) {
+      if (dispatchedJobIds.has(item.jobId) && item.status === "terminal") {
+        item.status = "notified";
+      }
+    }
+    if (dispatch.final) {
+      if (
+        group.items.some((item) => item.status === "pending") ||
+        (group.pendingSubmissions?.length ?? 0) > 0
+      ) {
+        throw new Error(`refusing to complete group ${id} with pending work`);
+      }
+      group.status = "completed";
+    } else {
+      group.status = "watching";
+    }
+    group.error = undefined;
+    writeGroup(group);
+    assertExternalWaitOwnership(reference);
+    appendLog(
+      group.id,
+      `resumed agent ${group.agentId} jobs=${dispatch.items.map((item) => item.jobId).join(",")} final=${dispatch.final}`,
+    );
+    if (dispatch.final) {
+      maybeCrashAfterFinalPersistence("slurm-group");
+      releaseExternalWaitClaim(reference);
+      return true;
+    }
+    return false;
   });
-  if (group.status === "cancelled" || group.status === "completed") return;
-  appendLog(id, `watching group mode=${group.mode} jobs=${group.items.map((item) => item.jobId).join(",")}`);
+}
+
+async function watchGroup(id: string, controllerGeneration: string): Promise<void> {
+  let group = readGroup(id);
+  const started = await withExternalWaitTransition(group.agentId, () => {
+    group = readGroup(id);
+    assertGroupController(group, controllerGeneration);
+    if (["cancelling", "cancelled", "abandoned", "completed", "callback_ambiguous", "finalizing"].includes(group.status)) {
+      return false;
+    }
+    group.status = "watching";
+    group.watcherPid = process.pid;
+    group.watcherStart = processStartIdentity(process.pid);
+    writeGroup(group);
+    return true;
+  });
+  if (!started) return;
+  appendLog(
+    id,
+    `watching group mode=${group.mode} jobs=${group.items.map((item) => item.jobId).join(",")} controller=${controllerGeneration}`,
+  );
   const sentinelWatcher = new SentinelWatcher();
   const nextSacctAt = new Map<string, number>();
   try {
     while (true) {
       group = readGroup(id);
-      if (group.status === "cancelled" || group.status === "completed") return;
+      if (["cancelling", "cancelled", "abandoned", "completed", "callback_ambiguous", "finalizing"].includes(group.status)) return;
+      if (group.controllerGeneration !== controllerGeneration) return;
       const pendingItems = group.items.filter((candidate) => candidate.status === "pending");
       sentinelWatcher.update(pendingItems.map((item) => item.sentinelPath));
       const observedGeneration = sentinelWatcher.snapshot();
@@ -821,12 +1148,18 @@ async function watchGroup(id: string): Promise<void> {
             nextSacctAt.set(item.jobId, Date.now() + backupIntervalSeconds * 1000);
           }
           if (!result) continue;
-          mutateGroup(id, (current) => {
-            const currentItem = current.items.find((candidate) => candidate.jobId === item.jobId);
-            if (!currentItem || currentItem.status !== "pending") return;
+          const accepted = await withExternalWaitTransition(group.agentId, () => {
+            group = readGroup(id);
+            assertGroupController(group, controllerGeneration);
+            if (!["watching", "resume_failed"].includes(group.status)) return false;
+            const currentItem = group.items.find((candidate) => candidate.jobId === item.jobId);
+            if (!currentItem || currentItem.status !== "pending") return false;
             currentItem.status = "terminal";
             currentItem.result = result;
+            writeGroup(group);
+            return true;
           });
+          if (!accepted) continue;
           nextSacctAt.delete(item.jobId);
           appendLog(
             id,
@@ -841,31 +1174,11 @@ async function watchGroup(id: string): Promise<void> {
       }
 
       group = readGroup(id);
-      let dispatch = selectGroupDispatch(group);
-      if (dispatch) {
+      if (selectGroupDispatch(group)) {
         try {
-          await waitForAgentToPark(group);
-          group = readGroup(id);
-          if (group.status === "cancelled" || group.status === "completed") return;
-          dispatch = selectGroupDispatch(group);
-          if (!dispatch) continue;
-          await sendGroupResume(group, dispatch.items, dispatch.final);
-          const dispatchedJobIds = new Set(dispatch.items.map((item) => item.jobId));
-          group = mutateGroup(id, (current) => {
-            for (const item of current.items) {
-              if (dispatchedJobIds.has(item.jobId) && item.status === "terminal") {
-                item.status = "notified";
-              }
-            }
-            current.status = dispatch?.final ? "completed" : "watching";
-            current.error = undefined;
-          });
-          if (dispatch.final) return;
+          if (await finalizeGroupDispatch(id, controllerGeneration)) return;
         } catch (error) {
-          mutateGroup(id, (current) => {
-            current.status = "resume_failed";
-            current.error = error instanceof Error ? error.message : String(error);
-          });
+          appendLog(id, `group callback stopped: ${error instanceof Error ? error.message : String(error)}`);
           process.exitCode = 1;
           return;
         }
@@ -952,7 +1265,7 @@ function isSlurmArrayJob(jobId: string): boolean {
   return /(?:^|\s)ArrayJobId=\d+(?:\s|$)/m.test(shown.stdout);
 }
 
-function submit(argv: string[]): void {
+async function submit(argv: string[]): Promise<void> {
   const separatorIndex = argv.indexOf("--");
   if (separatorIndex === -1 || separatorIndex === argv.length - 1) {
     throw new Error("submit requires `-- SCRIPT [ARGS...]`");
@@ -967,93 +1280,139 @@ function submit(argv: string[]): void {
     throw new Error("--mode must be all or each");
   }
   const paseoBin = stringOption(args, "paseo-bin") || "paseo";
-  let group = activeGroupForAgent(agentId);
-  if (!group) {
-    const intervalSeconds = Number(stringOption(args, "sacct-interval") || "60");
-    const sentinelPollSeconds = Number(stringOption(args, "sentinel-poll") || "1");
-    if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds < 1) {
-      throw new Error("--sacct-interval must be a positive integer");
+  await withExternalWaitTransition(agentId, () => {
+    let group = activeGroupForAgent(agentId);
+    if (!group) {
+      const intervalSeconds = Number(stringOption(args, "sacct-interval") || "60");
+      const sentinelPollSeconds = Number(stringOption(args, "sentinel-poll") || "1");
+      if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds < 1) {
+        throw new Error("--sacct-interval must be a positive integer");
+      }
+      if (!Number.isSafeInteger(sentinelPollSeconds) || sentinelPollSeconds < 1) {
+        throw new Error("--sentinel-poll must be a positive integer");
+      }
+      group = createGroupRecordLocked({
+        agentId,
+        mode: (requestedMode || "each") as WaitGroupMode,
+        intervalSeconds,
+        sentinelPollSeconds,
+        paseoBin,
+      });
+    } else {
+      group = adoptGroupClaim(group);
+      if (requestedMode && requestedMode !== group.mode) {
+        throw new Error(`active group ${group.id} uses mode=${group.mode}, not ${requestedMode}`);
+      }
+      if (group.mode === "all" && group.status === "watching") {
+        throw new Error("cannot submit jobs to an all-mode group after watching starts");
+      }
+      if (["callback_ambiguous", "finalizing", "cancelling", "completed", "cancelled", "abandoned"].includes(group.status)) {
+        throw new Error(`cannot submit jobs to ${group.status} group ${group.id}`);
+      }
     }
-    if (!Number.isSafeInteger(sentinelPollSeconds) || sentinelPollSeconds < 1) {
-      throw new Error("--sentinel-poll must be a positive integer");
+
+    ensureStateDirs();
+    const source = readFileSync(scriptPath, "utf8");
+    const sentinelMode = stringOption(args, "sentinel") || "auto";
+    if (sentinelMode !== "auto" && sentinelMode !== "off") {
+      throw new Error("--sentinel must be auto or off");
     }
-    group = createGroupRecord({
-      agentId,
-      mode: (requestedMode || "each") as WaitGroupMode,
-      intervalSeconds,
-      sentinelPollSeconds,
-      paseoBin,
+    const submissionToken = randomUUID();
+    let submittedScriptPath = scriptPath;
+    let sentinelPath: string | undefined;
+    const sourceDeclaresArray = hasArrayDirective(source);
+    if (sentinelMode === "auto" && !sourceDeclaresArray) {
+      sentinelPath = join(sentinelsDir(), `${group.id}-${submissionToken}.done`);
+      submittedScriptPath = join(submissionScriptsDir(), `${group.id}-${submissionToken}.sbatch`);
+      writeFileSync(
+        submittedScriptPath,
+        buildSentinelWrapper(source, scriptPath, sentinelPath),
+        { mode: 0o700 },
+      );
+    }
+
+    group = readGroup(group.id);
+    assertExternalWaitOwnership(groupRef(group));
+    if (["callback_ambiguous", "finalizing", "cancelling", "completed", "cancelled", "abandoned"].includes(group.status)) {
+      throw new Error(`cannot submit jobs to ${group.status} group ${group.id}`);
+    }
+    group.pendingSubmissions ??= [];
+    group.pendingSubmissions.push({
+      token: submissionToken,
+      scriptPath: submittedScriptPath,
+      createdAt: new Date().toISOString(),
     });
-  } else {
-    if (requestedMode && requestedMode !== group.mode) {
-      throw new Error(`active group ${group.id} uses mode=${group.mode}, not ${requestedMode}`);
-    }
-    if (group.mode === "all" && group.status === "watching") {
-      throw new Error("cannot submit jobs to an all-mode group after watching starts");
-    }
-  }
+    writeGroup(group);
 
-  ensureStateDirs();
-  const source = readFileSync(scriptPath, "utf8");
-  const sentinelMode = stringOption(args, "sentinel") || "auto";
-  if (sentinelMode !== "auto" && sentinelMode !== "off") {
-    throw new Error("--sentinel must be auto or off");
-  }
-  let submittedScriptPath = scriptPath;
-  let sentinelPath: string | undefined;
-  const sourceDeclaresArray = hasArrayDirective(source);
-  if (sentinelMode === "auto" && !sourceDeclaresArray) {
-    const token = randomUUID();
-    sentinelPath = join(sentinelsDir(), `${group.id}-${token}.done`);
-    submittedScriptPath = join(submissionScriptsDir(), `${group.id}-${token}.sbatch`);
-    writeFileSync(
-      submittedScriptPath,
-      buildSentinelWrapper(source, scriptPath, sentinelPath),
-      { mode: 0o700 },
-    );
-  }
-
-  const submitted = spawnSync("sbatch", ["--parsable", submittedScriptPath, ...scriptArgs], {
-    encoding: "utf8",
-    timeout: 30_000,
-  });
-  if (submitted.error || submitted.status !== 0) {
-    throw new Error(
-      submitted.error?.message || submitted.stderr.trim() || `sbatch exited ${submitted.status}`,
-    );
-  }
-  const rawJobId = submitted.stdout.trim().split(";", 1)[0];
-  const jobId = validateJobId(rawJobId);
-  const arrayJob = sourceDeclaresArray || isSlurmArrayJob(jobId);
-  if (arrayJob) sentinelPath = undefined;
-  try {
-    group = mutateGroup(group.id, (current) => {
-      current.items.push({
+    const submitted = spawnSync("sbatch", ["--parsable", submittedScriptPath, ...scriptArgs], {
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    if (submitted.error || submitted.status !== 0) {
+      if (!submitted.error && typeof submitted.status === "number" && submitted.status !== 0) {
+        group = readGroup(group.id);
+        assertExternalWaitOwnership(groupRef(group));
+        group.pendingSubmissions = (group.pendingSubmissions ?? []).filter(
+          (submission) => submission.token !== submissionToken,
+        );
+        writeGroup(group);
+      }
+      const detail =
+        submitted.error?.message || submitted.stderr.trim() || `sbatch exited ${submitted.status}`;
+      throw new Error(
+        submitted.error || submitted.status === null
+          ? `${detail}; submission ${submissionToken} is ambiguous and must be repaired explicitly`
+          : detail,
+      );
+    }
+    const rawJobId = submitted.stdout.trim().split(";", 1)[0];
+    let jobId: string;
+    let arrayJob: boolean;
+    try {
+      jobId = validateJobId(rawJobId);
+      arrayJob = sourceDeclaresArray || isSlurmArrayJob(jobId);
+    } catch (error) {
+      console.error(
+        `AMBIGUOUS_SLURM_SUBMISSION group_id=${group.id} submission=${submissionToken} raw_job_id=${JSON.stringify(rawJobId)}`,
+      );
+      throw error;
+    }
+    if (arrayJob) sentinelPath = undefined;
+    try {
+      group = readGroup(group.id);
+      assertExternalWaitOwnership(groupRef(group));
+      if (["callback_ambiguous", "finalizing", "cancelling", "completed", "cancelled", "abandoned"].includes(group.status)) {
+        throw new Error(`cannot add submitted job to ${group.status} group ${group.id}`);
+      }
+      if (!(group.pendingSubmissions ?? []).some((submission) => submission.token === submissionToken)) {
+        throw new Error(`submission marker ${submissionToken} disappeared from group ${group.id}`);
+      }
+      group.items.push({
         jobId,
         sentinelPath,
         array: arrayJob || undefined,
         resumePrompt: stringOption(args, "resume-prompt"),
         status: "pending",
       });
-    });
-  } catch (error) {
-    console.error(`UNTRACKED_SLURM_JOB job_id=${jobId} group_id=${group.id}`);
-    throw error;
-  }
-  console.log(
-    `SUBMITTED_SLURM group_id=${group.id} mode=${group.mode} job_id=${jobId} array=${arrayJob} sentinel=${sentinelPath ?? "none"}`,
-  );
+      group.pendingSubmissions = group.pendingSubmissions?.filter(
+        (submission) => submission.token !== submissionToken,
+      );
+      writeGroup(group);
+    } catch (error) {
+      console.error(
+        `UNTRACKED_SLURM_JOB job_id=${jobId} group_id=${group.id} submission=${submissionToken}`,
+      );
+      throw error;
+    }
+    console.log(
+      `SUBMITTED_SLURM group_id=${group.id} mode=${group.mode} job_id=${jobId} array=${arrayJob} sentinel=${sentinelPath ?? "none"} submission=${submissionToken}`,
+    );
+  });
 }
 
-function register(args: ParsedArgs): void {
+async function register(args: ParsedArgs): Promise<void> {
   const agentId = stringOption(args, "agent-id") || process.env.PASEO_AGENT_ID?.trim();
   if (!agentId) throw new Error("--agent-id is required outside a Paseo agent");
-  const activeLocalWaitId = activeLocalWaitIdForAgent(agentId);
-  if (activeLocalWaitId) {
-    throw new Error(
-      `agent ${agentId} already owns active paseo-local task ${activeLocalWaitId}; finish it before registering a Slurm wait`,
-    );
-  }
   const jobId = validateJobId(requiredOption(args, "job-id"));
   const arrayJob = isSlurmArrayJob(jobId);
   const sentinelPath = arrayJob ? undefined : stringOption(args, "sentinel");
@@ -1071,7 +1430,7 @@ function register(args: ParsedArgs): void {
   }
   const id = `${agentId.slice(0, 8)}-${jobId}-${Date.now()}`;
   const now = new Date().toISOString();
-  const registration: Registration = {
+  let registration: Registration = {
     id,
     agentId,
     jobId,
@@ -1083,27 +1442,34 @@ function register(args: ParsedArgs): void {
     paseoBin: stringOption(args, "paseo-bin") || "paseo",
     createdAt: now,
     updatedAt: now,
-    status: "registered",
+    status: "preparing",
   };
-  const labelError = updateExternalWaitLabel(registration, id);
-  if (labelError) {
-    throw new Error(`failed to register external wait with Paseo: ${labelError}`);
-  }
-  try {
+  await withExternalWaitTransition(agentId, () => {
+    const claim = claimExternalWait({
+      agentId: registration.agentId,
+      waitId: registration.id,
+      kind: "slurm-registration",
+    });
+    maybeCrashAfterClaim("slurm-registration");
+    registration.claimGeneration = claim.generation;
     writeRegistration(registration);
-    registration.watcherPid = spawnWatcher(id);
-    registration.status = "watching";
+    const labelError = updateExternalWaitLabelOwned(registration, registrationRef(registration), id);
+    if (labelError) {
+      registration.error = `failed to set external-wait label: ${labelError}`;
+      writeRegistration(registration);
+      throw new Error(`failed to register external wait with Paseo: ${labelError}`);
+    }
+    registration.status = "registered";
+    registration.error = undefined;
     writeRegistration(registration);
-  } catch (error) {
-    updateExternalWaitLabel(registration, "");
-    throw error;
-  }
+    registration = ensureRegistrationControllerLocked(registration);
+  });
   console.log(
     `WAITING_SLURM registration_id=${id} job_id=${jobId} watcher_pid=${registration.watcherPid}`,
   );
 }
 
-function createGroup(args: ParsedArgs): void {
+async function createGroup(args: ParsedArgs): Promise<void> {
   const agentId = stringOption(args, "agent-id") || process.env.PASEO_AGENT_ID?.trim();
   if (!agentId) throw new Error("--agent-id is required outside a Paseo agent");
   const rawMode = stringOption(args, "mode") || "each";
@@ -1120,76 +1486,126 @@ function createGroup(args: ParsedArgs): void {
   if (!Number.isSafeInteger(sentinelPollSeconds) || sentinelPollSeconds < 1) {
     throw new Error("--sentinel-poll must be a positive integer");
   }
-  const group = createGroupRecord({
-    agentId,
-    mode: rawMode,
-    intervalSeconds,
-    sentinelPollSeconds,
-    paseoBin: stringOption(args, "paseo-bin") || "paseo",
+  const group = await withExternalWaitTransition(agentId, () => {
+    return createGroupRecordLocked({
+      agentId,
+      mode: rawMode,
+      intervalSeconds,
+      sentinelPollSeconds,
+      paseoBin: stringOption(args, "paseo-bin") || "paseo",
+    });
   });
   console.log(
     `SLURM_GROUP group_id=${group.id} mode=${rawMode} sacct_interval=${intervalSeconds} sentinel_poll=${sentinelPollSeconds}`,
   );
 }
 
-function addGroupJob(args: ParsedArgs): void {
+async function addGroupJob(args: ParsedArgs): Promise<void> {
   const id = args.positionals[2];
   if (!id) throw new Error("group ID is required");
   const jobId = validateJobId(requiredOption(args, "job-id"));
   const sentinelPath = stringOption(args, "sentinel");
   const arrayJob = isSlurmArrayJob(jobId);
-  const group = mutateGroup(id, (current) => {
-    if (current.status === "completed" || current.status === "cancelled") {
-      throw new Error(`cannot add a job to ${current.status} group ${id}`);
+  let group = readGroup(id);
+  await withExternalWaitTransition(group.agentId, async () => {
+    group = readGroup(id);
+    if (["callback_ambiguous", "finalizing", "completed", "cancelling", "cancelled", "abandoned"].includes(group.status)) {
+      throw new Error(`cannot add a job to ${group.status} group ${id}`);
     }
-    if (current.mode === "all" && current.status === "watching") {
+    group = adoptGroupClaim(group);
+    if (group.mode === "all" && group.status === "watching") {
       throw new Error("cannot add jobs to an all-mode group after watching starts");
     }
-    if (current.items.some((item) => item.jobId === jobId)) {
+    if (group.items.some((item) => item.jobId === jobId)) {
       throw new Error(`job ${jobId} is already in group ${id}`);
     }
-    current.items.push({
+    group.items.push({
       jobId,
       sentinelPath: sentinelPath && !arrayJob ? resolve(sentinelPath) : undefined,
       array: arrayJob || undefined,
       resumePrompt: stringOption(args, "resume-prompt"),
       status: "pending",
     });
+    writeGroup(group);
   });
   console.log(`SLURM_GROUP_ADDED group_id=${id} job_id=${jobId} jobs=${group.items.length}`);
 }
 
-function waitGroup(args: ParsedArgs): void {
+async function repairGroupSubmission(args: ParsedArgs): Promise<void> {
+  const id = args.positionals[2];
+  if (!id) throw new Error("group ID is required");
+  const token = requiredOption(args, "submission");
+  const rawJobId = stringOption(args, "job-id");
+  const drop = args.options.get("drop-submission") === true;
+  if ((rawJobId ? 1 : 0) + (drop ? 1 : 0) !== 1) {
+    throw new Error("repair requires exactly one of --job-id ID or --drop-submission");
+  }
+  const jobId = rawJobId ? validateJobId(rawJobId) : undefined;
+  let group = readGroup(id);
+  await withExternalWaitTransition(group.agentId, () => {
+    group = readGroup(id);
+    if (["callback_ambiguous", "finalizing", "completed", "cancelling", "cancelled", "abandoned"].includes(group.status)) {
+      throw new Error(`cannot repair a submission in ${group.status} group ${id}`);
+    }
+    group = adoptGroupClaim(group);
+    if (!(group.pendingSubmissions ?? []).some((submission) => submission.token === token)) {
+      throw new Error(`group ${id} has no pending submission ${token}`);
+    }
+    if (jobId) {
+      if (group.items.some((item) => item.jobId === jobId)) {
+        throw new Error(`job ${jobId} is already in group ${id}`);
+      }
+      const arrayJob = args.options.get("array") === true || isSlurmArrayJob(jobId);
+      const sentinelPath = stringOption(args, "sentinel");
+      group.items.push({
+        jobId,
+        sentinelPath: sentinelPath && !arrayJob ? resolve(sentinelPath) : undefined,
+        array: arrayJob || undefined,
+        resumePrompt: stringOption(args, "resume-prompt"),
+        status: "pending",
+      });
+    }
+    group.pendingSubmissions = group.pendingSubmissions?.filter(
+      (submission) => submission.token !== token,
+    );
+    assertExternalWaitOwnership(groupRef(group));
+    writeGroup(group);
+  });
+  console.log(
+    jobId
+      ? `repaired_submission=${token} group_id=${id} job_id=${jobId}`
+      : `dropped_submission=${token} group_id=${id}`,
+  );
+}
+
+async function waitGroup(args: ParsedArgs): Promise<void> {
   const id = args.positionals[2];
   if (!id) throw new Error("group ID is required");
   let group = readGroup(id);
-  if (group.items.length === 0) throw new Error(`group ${id} has no jobs`);
-  if (group.status === "completed" || group.status === "cancelled") {
-    throw new Error(`cannot wait on ${group.status} group ${id}`);
-  }
-  const labelError = updateExternalWaitLabel(group, id);
-  if (labelError) {
-    throw new Error(`failed to activate external wait group with Paseo: ${labelError}`);
-  }
-  if (!isProcessAlive(group.watcherPid)) {
-    const watcherPid = spawnGroupWatcher(id);
-    group = mutateGroup(id, (current) => {
-      current.watcherPid = watcherPid;
-      current.status = "watching";
-      current.error = undefined;
-    });
-  }
+  await withExternalWaitTransition(group.agentId, () => {
+    group = readGroup(id);
+    if (group.items.length === 0) throw new Error(`group ${id} has no jobs`);
+    if (["callback_ambiguous", "finalizing", "completed", "cancelling", "cancelled", "abandoned"].includes(group.status)) {
+      throw new Error(`cannot wait on ${group.status} group ${id}`);
+    }
+    group = adoptGroupClaim(group);
+    const labelError = updateExternalWaitLabelOwned(group, groupRef(group), id);
+    if (labelError) {
+      throw new Error(`failed to activate external wait group with Paseo: ${labelError}`);
+    }
+    group = ensureGroupControllerLocked(group);
+  });
   console.log(
     `WAITING_SLURM_GROUP group_id=${id} mode=${group.mode} jobs=${group.items.map((item) => item.jobId).join(",")} watcher_pid=${group.watcherPid}`,
   );
 }
 
-function waitCurrentGroup(args: ParsedArgs): void {
+async function waitCurrentGroup(args: ParsedArgs): Promise<void> {
   const agentId = stringOption(args, "agent-id") || process.env.PASEO_AGENT_ID?.trim();
   if (!agentId) throw new Error("--agent-id is required outside a Paseo agent");
   const group = activeGroupForAgent(agentId);
   if (!group) throw new Error(`agent ${agentId} has no active Slurm wait group`);
-  waitGroup({
+  await waitGroup({
     positionals: ["group", "wait", group.id],
     options: args.options,
   });
@@ -1209,38 +1625,67 @@ function groupStatus(args: ParsedArgs): void {
   console.log(JSON.stringify(rows, null, 2));
 }
 
-function cancelGroup(args: ParsedArgs): void {
+async function cancelGroup(args: ParsedArgs): Promise<void> {
   const id = args.positionals[2];
   if (!id) throw new Error("group ID is required");
-  const group = mutateGroup(id, (current) => {
-    current.status = "cancelled";
+  let group = readGroup(id);
+  await withExternalWaitTransition(group.agentId, async () => {
+    group = readGroup(id);
+    if (["callback_ambiguous", "finalizing", "completed", "cancelled", "abandoned"].includes(group.status)) {
+      throw new Error(`cannot cancel ${group.status} group ${id}`);
+    }
+    group = adoptGroupClaim(group);
+    let reference = groupRef(group);
+    assertExternalWaitOwnership(reference);
+    const oldWatcherPid = group.watcherPid;
+    const oldWatcherStart = group.watcherStart;
+    group.status = "cancelling";
+    group.controllerGeneration = `cancelled-${randomUUID()}`;
+    group.watcherPid = undefined;
+    group.watcherStart = undefined;
+    writeGroup(group);
+    assertExternalWaitOwnership(reference);
+    await stopController(oldWatcherPid, oldWatcherStart);
+    group = readGroup(id);
+    reference = groupRef(group);
+    assertExternalWaitOwnership(reference);
+    const labelError = updateExternalWaitLabelOwned(group, reference, "");
+    if (labelError) {
+      group.error = `failed to clear external wait label: ${labelError}`;
+      writeGroup(group);
+      throw new Error(`cancelling group failed to clear external wait label: ${labelError}`);
+    }
+    group.status = "cancelled";
+    group.error = undefined;
+    writeGroup(group);
+    assertExternalWaitOwnership(reference);
+    releaseExternalWaitClaim(reference);
   });
-  const labelError = updateExternalWaitLabel(group, "");
-  if (labelError) {
-    throw new Error(`cancelled group but failed to clear external wait label: ${labelError}`);
-  }
   console.log(`cancelled_group=${id}`);
 }
 
-function groupCommand(args: ParsedArgs): void {
+async function groupCommand(args: ParsedArgs): Promise<void> {
   switch (args.positionals[1]) {
     case "create":
-      createGroup(args);
+      await createGroup(args);
       break;
     case "add":
-      addGroupJob(args);
+      await addGroupJob(args);
       break;
     case "wait":
-      waitGroup(args);
+      await waitGroup(args);
       break;
     case "status":
       groupStatus(args);
       break;
     case "cancel":
-      cancelGroup(args);
+      await cancelGroup(args);
+      break;
+    case "repair":
+      await repairGroupSubmission(args);
       break;
     default:
-      throw new Error("group command must be create, add, wait, status, or cancel");
+      throw new Error("group command must be create, add, wait, status, cancel, or repair");
   }
 }
 
@@ -1258,46 +1703,252 @@ function status(args: ParsedArgs): void {
   console.log(JSON.stringify(rows, null, 2));
 }
 
-function recover(): void {
+async function recover(): Promise<void> {
   ensureStateDirs();
   let recovered = 0;
+  let attention = 0;
   for (const name of readdirSync(registrationsDir()).filter((entry) => entry.endsWith(".json"))) {
-    const registration = JSON.parse(
+    let registration = JSON.parse(
       readFileSync(join(registrationsDir(), name), "utf8"),
     ) as Registration;
-    if (!["registered", "watching", "terminal", "resume_failed"].includes(registration.status)) continue;
-    if (isProcessAlive(registration.watcherPid)) continue;
-    registration.status = "registered";
-    registration.error = undefined;
-    registration.watcherPid = spawnWatcher(registration.id);
-    writeRegistration(registration);
-    recovered += 1;
+    try {
+      await withExternalWaitTransition(registration.agentId, () => {
+        registration = readRegistration(registration.id);
+        const existingClaim = readExternalWaitClaim(registration.agentId);
+        if (["resumed", "cancelled", "abandoned"].includes(registration.status)) {
+          if (
+            existingClaim &&
+            registration.claimGeneration === existingClaim.generation &&
+            existingClaim.waitId === registration.id &&
+            existingClaim.kind === "slurm-registration"
+          ) {
+            releaseExternalWaitClaim(registrationRef(registration));
+          }
+          return;
+        }
+        if (registration.status === "finalizing" || registration.status === "cancelling") {
+          registration = adoptRegistrationClaim(registration);
+          appendLog(registration.id, `recovery requires explicit abandon for ${registration.status} registration`);
+          console.error(
+            `ATTENTION_EXTERNAL_WAIT kind=slurm-registration agent_id=${registration.agentId} wait_id=${registration.id} generation=${registration.claimGeneration} status=${registration.status}; inspect before exact-generation abandon`,
+          );
+          attention += 1;
+          return;
+        }
+        registration = adoptRegistrationClaim(registration);
+        if (registration.status === "preparing") {
+          const labelError = updateExternalWaitLabelOwned(
+            registration,
+            registrationRef(registration),
+            registration.id,
+          );
+          if (labelError) throw new Error(`failed to recover preparing label: ${labelError}`);
+          registration.status = "registered";
+          registration.error = undefined;
+          writeRegistration(registration);
+        }
+        const hadLiveController = isProcessAlive(
+          registration.watcherPid,
+          registration.watcherStart,
+        );
+        registration = ensureRegistrationControllerLocked(registration);
+        if (!hadLiveController) recovered += 1;
+      });
+    } catch (error) {
+      appendLog(
+        registration.id,
+        `recovery skipped: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      attention += 1;
+    }
   }
   let recoveredGroups = 0;
   for (const name of readdirSync(groupsDir()).filter((entry) => entry.endsWith(".json"))) {
-    const group = JSON.parse(readFileSync(join(groupsDir(), name), "utf8")) as WaitGroup;
-    if (!["watching", "resume_failed"].includes(group.status)) continue;
-    if (isProcessAlive(group.watcherPid)) continue;
-    group.status = "watching";
-    group.error = undefined;
-    group.watcherPid = spawnGroupWatcher(group.id);
-    writeGroup(group);
-    recoveredGroups += 1;
+    let group = JSON.parse(readFileSync(join(groupsDir(), name), "utf8")) as WaitGroup;
+    try {
+      await withExternalWaitTransition(group.agentId, () => {
+        group = readGroup(group.id);
+        const existingClaim = readExternalWaitClaim(group.agentId);
+        if (["completed", "cancelled", "abandoned"].includes(group.status)) {
+          if (
+            group.status === "completed" &&
+            (group.items.some((item) => item.status === "pending") ||
+              (group.pendingSubmissions?.length ?? 0) > 0)
+          ) {
+            appendLog(group.id, "recovery refused completed group containing pending work");
+            attention += 1;
+            return;
+          }
+          if (
+            existingClaim &&
+            group.claimGeneration === existingClaim.generation &&
+            existingClaim.waitId === group.id &&
+            existingClaim.kind === "slurm-group"
+          ) {
+            releaseExternalWaitClaim(groupRef(group));
+          }
+          return;
+        }
+        if (["callback_ambiguous", "finalizing", "cancelling"].includes(group.status)) {
+          group = adoptGroupClaim(group);
+          appendLog(group.id, `recovery requires explicit abandon for ${group.status} group`);
+          console.error(
+            `ATTENTION_EXTERNAL_WAIT kind=slurm-group agent_id=${group.agentId} wait_id=${group.id} generation=${group.claimGeneration} status=${group.status}; inspect before exact-generation abandon`,
+          );
+          attention += 1;
+          return;
+        }
+        group = adoptGroupClaim(group);
+        if (group.status === "preparing") {
+          const labelError = updateExternalWaitLabelOwned(group, groupRef(group), group.id);
+          if (labelError) throw new Error(`failed to recover preparing label: ${labelError}`);
+          group.status = "open";
+          group.error = undefined;
+          writeGroup(group);
+          return;
+        }
+        if (["watching", "resume_failed"].includes(group.status)) {
+          const hadLiveController = isProcessAlive(group.watcherPid, group.watcherStart);
+          group = ensureGroupControllerLocked(group);
+          if (!hadLiveController) recoveredGroups += 1;
+        }
+      });
+    } catch (error) {
+      appendLog(
+        group.id,
+        `recovery skipped: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      attention += 1;
+    }
   }
-  console.log(`recovered=${recovered} recovered_groups=${recoveredGroups}`);
+  let orphanClaims = 0;
+  for (const claim of listExternalWaitClaims().filter((candidate) =>
+    candidate.kind === "slurm-registration" || candidate.kind === "slurm-group"
+  )) {
+    const recordExists =
+      claim.kind === "slurm-registration"
+        ? existsSync(registrationPath(claim.waitId))
+        : existsSync(groupPath(claim.waitId));
+    if (recordExists) continue;
+    orphanClaims += 1;
+    attention += 1;
+    console.error(
+      `ORPHAN_EXTERNAL_WAIT kind=${claim.kind} agent_id=${claim.agentId} wait_id=${claim.waitId} generation=${claim.generation}; use abandon with these exact ownership values after checking Paseo`,
+    );
+  }
+  console.log(
+    `recovered=${recovered} recovered_groups=${recoveredGroups} attention_required=${attention} orphan_claims=${orphanClaims}`,
+  );
 }
 
-function cancel(args: ParsedArgs): void {
+async function cancel(args: ParsedArgs): Promise<void> {
   const id = args.positionals[1];
   if (!id) throw new Error("registration ID is required");
-  const registration = readRegistration(id);
-  registration.status = "cancelled";
-  writeRegistration(registration);
-  const labelError = updateExternalWaitLabel(registration, "");
-  if (labelError) {
-    throw new Error(`cancelled watcher but failed to clear external wait label: ${labelError}`);
-  }
+  let registration = readRegistration(id);
+  await withExternalWaitTransition(registration.agentId, async () => {
+    registration = readRegistration(id);
+    if (["finalizing", "resumed", "cancelled", "abandoned"].includes(registration.status)) {
+      throw new Error(`cannot cancel ${registration.status} registration ${id}`);
+    }
+    registration = adoptRegistrationClaim(registration);
+    let reference = registrationRef(registration);
+    assertExternalWaitOwnership(reference);
+    const oldWatcherPid = registration.watcherPid;
+    const oldWatcherStart = registration.watcherStart;
+    registration.status = "cancelling";
+    registration.controllerGeneration = `cancelled-${randomUUID()}`;
+    registration.watcherPid = undefined;
+    registration.watcherStart = undefined;
+    writeRegistration(registration);
+    assertExternalWaitOwnership(reference);
+    await stopController(oldWatcherPid, oldWatcherStart);
+    registration = readRegistration(id);
+    reference = registrationRef(registration);
+    assertExternalWaitOwnership(reference);
+    const labelError = updateExternalWaitLabelOwned(registration, reference, "");
+    if (labelError) {
+      registration.error = `failed to clear external wait label: ${labelError}`;
+      writeRegistration(registration);
+      throw new Error(`cancelling registration failed to clear external wait label: ${labelError}`);
+    }
+    registration.status = "cancelled";
+    registration.error = undefined;
+    writeRegistration(registration);
+    assertExternalWaitOwnership(reference);
+    releaseExternalWaitClaim(reference);
+  });
   console.log(`cancelled=${id}`);
+}
+
+async function abandon(args: ParsedArgs): Promise<void> {
+  const agentId = stringOption(args, "agent-id") || process.env.PASEO_AGENT_ID?.trim();
+  if (!agentId) throw new Error("--agent-id is required outside a Paseo agent");
+  const waitId = stringOption(args, "wait-id") || args.positionals[1];
+  if (!waitId) throw new Error("--wait-id is required");
+  const generation = requiredOption(args, "generation");
+  const paseoBin = stringOption(args, "paseo-bin") || "paseo";
+  await withExternalWaitTransition(agentId, () => {
+    const owner = readExternalWaitClaim(agentId);
+    if (
+      !owner ||
+      owner.waitId !== waitId ||
+      owner.generation !== generation ||
+      !["slurm-registration", "slurm-group"].includes(owner.kind)
+    ) {
+      throw new Error(`ownership check failed for abandoned Slurm wait ${waitId}`);
+    }
+    assertExternalWaitOwnership(owner);
+    let controllerOwner: ExternalWaitOwner = { id: waitId, agentId, paseoBin };
+    if (owner.kind === "slurm-registration" && existsSync(registrationPath(waitId))) {
+      const registration = readRegistration(waitId);
+      if (registration.claimGeneration !== generation) {
+        throw new Error(`registration ${waitId} generation does not match the claim`);
+      }
+      if (isProcessAlive(registration.watcherPid, registration.watcherStart)) {
+        throw new Error(`registration ${waitId} still has a live controller`);
+      }
+      registration.status = "cancelling";
+      registration.controllerGeneration = `abandoned-${randomUUID()}`;
+      registration.watcherPid = undefined;
+      registration.watcherStart = undefined;
+      registration.error = "explicit abandon in progress";
+      writeRegistration(registration);
+      controllerOwner = registration;
+    } else if (owner.kind === "slurm-group" && existsSync(groupPath(waitId))) {
+      const group = readGroup(waitId);
+      if (group.claimGeneration !== generation) {
+        throw new Error(`group ${waitId} generation does not match the claim`);
+      }
+      if (isProcessAlive(group.watcherPid, group.watcherStart)) {
+        throw new Error(`group ${waitId} still has a live controller`);
+      }
+      group.status = "cancelling";
+      group.controllerGeneration = `abandoned-${randomUUID()}`;
+      group.watcherPid = undefined;
+      group.watcherStart = undefined;
+      group.error = "explicit abandon in progress";
+      writeGroup(group);
+      controllerOwner = group;
+    }
+    const labelError = updateExternalWaitLabelOwned(controllerOwner, owner, "");
+    if (labelError) throw new Error(`failed to clear abandoned wait label: ${labelError}`);
+    if (owner.kind === "slurm-registration" && existsSync(registrationPath(waitId))) {
+      const registration = readRegistration(waitId);
+      assertExternalWaitOwnership(owner);
+      registration.status = "abandoned";
+      registration.error = "explicitly abandoned after ownership-checked repair";
+      writeRegistration(registration);
+    } else if (owner.kind === "slurm-group" && existsSync(groupPath(waitId))) {
+      const group = readGroup(waitId);
+      assertExternalWaitOwnership(owner);
+      group.status = "abandoned";
+      group.error = "explicitly abandoned after ownership-checked repair";
+      writeGroup(group);
+    }
+    assertExternalWaitOwnership(owner);
+    releaseExternalWaitClaim(owner);
+  });
+  console.log(`abandoned=${waitId}`);
 }
 
 function usage(): void {
@@ -1316,8 +1967,13 @@ function usage(): void {
   paseo-slurm group wait GROUP_ID
   paseo-slurm group status [GROUP_ID]
   paseo-slurm group cancel GROUP_ID
+  paseo-slurm group repair GROUP_ID --submission TOKEN
+                           (--job-id ID [--sentinel PATH] [--array] |
+                            --drop-submission)
   paseo-slurm recover
-  paseo-slurm cancel REGISTRATION_ID`);
+  paseo-slurm cancel REGISTRATION_ID
+  paseo-slurm abandon --wait-id ID --generation TOKEN [--agent-id ID]
+                       [--paseo-bin PATH]`);
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -1325,37 +1981,44 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const command = args.positionals[0];
   switch (command) {
     case "submit":
-      submit(argv);
+      await submit(argv);
       break;
     case "wait":
-      waitCurrentGroup(args);
+      await waitCurrentGroup(args);
       break;
     case "register":
-      register(args);
+      await register(args);
       break;
     case "_watch": {
       const id = args.positionals[1];
       if (!id) throw new Error("registration ID is required");
-      await watchRegistration(id);
+      const controllerGeneration = args.positionals[2];
+      if (!controllerGeneration) throw new Error("controller generation is required");
+      await watchRegistration(id, controllerGeneration);
       break;
     }
     case "_watch_group": {
       const id = args.positionals[1];
       if (!id) throw new Error("group ID is required");
-      await watchGroup(id);
+      const controllerGeneration = args.positionals[2];
+      if (!controllerGeneration) throw new Error("controller generation is required");
+      await watchGroup(id, controllerGeneration);
       break;
     }
     case "group":
-      groupCommand(args);
+      await groupCommand(args);
       break;
     case "status":
       status(args);
       break;
     case "recover":
-      recover();
+      await recover();
       break;
     case "cancel":
-      cancel(args);
+      await cancel(args);
+      break;
+    case "abandon":
+      await abandon(args);
       break;
     case "help":
     case "--help":

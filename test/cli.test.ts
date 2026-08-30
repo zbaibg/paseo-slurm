@@ -137,6 +137,37 @@ test("each groups dispatch completed jobs while others remain pending", () => {
   );
 });
 
+test("pending submissions prevent group finality and support an empty final close", () => {
+  assert.deepEqual(
+    selectGroupDispatch({
+      mode: "each",
+      items: [completedItem],
+      pendingSubmissions: [
+        { token: "submit-1", scriptPath: "/tmp/job.sbatch", createdAt: "2026-08-30T00:00:00Z" },
+      ],
+    }),
+    { items: [completedItem], final: false },
+  );
+  assert.equal(
+    selectGroupDispatch({
+      mode: "all",
+      items: [completedItem],
+      pendingSubmissions: [
+        { token: "submit-1", scriptPath: "/tmp/job.sbatch", createdAt: "2026-08-30T00:00:00Z" },
+      ],
+    }),
+    undefined,
+  );
+  assert.deepEqual(
+    selectGroupDispatch({
+      mode: "each",
+      items: [{ ...completedItem, status: "notified" }],
+      pendingSubmissions: [],
+    }),
+    { items: [], final: true },
+  );
+});
+
 test("all groups wait until every job is terminal", () => {
   assert.equal(
     selectGroupDispatch({

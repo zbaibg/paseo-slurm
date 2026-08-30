@@ -17,6 +17,7 @@ support or the optional companion patch under `patches/paseo/` (see
 ## Requirements
 
 - Node.js 20 or newer
+- Linux `/proc` and util-linux `flock`
 - Slurm `sacct`
 - Paseo CLI 0.2.5 or newer
 - A Paseo agent environment containing `PASEO_AGENT_ID`, or an explicit
@@ -81,6 +82,8 @@ paseo-local wait [TASK_ID]
 paseo-local status [TASK_ID]
 paseo-local cancel TASK_ID [--signal SIGTERM]
 paseo-local recover
+paseo-local abandon --wait-id ID --generation TOKEN [--agent-id ID]
+                     [--paseo-bin PATH]
 ```
 
 `cancel` terminates the detached process group and still emits a final
@@ -89,9 +92,29 @@ paseo-local recover
 tasks that already have a terminal result; it does not guess the outcome of an
 orphaned process.
 
-One agent may own only one external wait controller at a time. Both commands
-refuse to start if that agent already has an active wait owned by the other
-command.
+One agent may own only one external wait at a time across `paseo-local`, a
+singleton Slurm registration, and a Slurm group (including `submit` in either
+mode). Creation first takes a per-agent kernel transition lock and publishes an
+atomic hard-link claim beneath
+`${XDG_STATE_HOME:-~/.local/state}/paseo-external-waits/claims`. Only then may it
+write the state record, set the Paseo label, or spawn a controller. Existing
+state files are checked under the same lock for compatibility with waits made
+before claims existed.
+
+The claim generation and a separate controller generation are persisted in
+the state record. Controller check-live, replacement, generation assignment,
+and PID plus Linux process-start identity persistence are one serialized
+transition. Every callback label update, send, final commit, and claim release
+rechecks durable ownership and controller generation while holding that lock.
+A Slurm cancellation adopts the exact claim, rejects a finalizing or completed
+wait, revokes the controller generation, stops the old controller when its
+exact process identity is available, clears the label, commits cancellation,
+and only then releases the claim. An old watcher therefore cannot clear or send
+after a replacement wait acquires ownership. `paseo-local cancel` instead
+keeps the same ownership while it terminates the payload and emits the final
+`CANCELLED` callback. The local payload also has an exact Linux PID/start
+identity; cancellation refuses an identity-less legacy record, signals only a
+matching process group, and clears both fields at terminal persistence.
 
 ## Submit and wait
 
@@ -109,6 +132,22 @@ paseo-slurm wait
 
 The original batch script must be on a path visible from compute nodes; do not
 submit a login node's private `/tmp` file.
+
+Before invoking `sbatch`, `submit` persists a unique pending-submission marker
+while holding the group transition lock. The successful job record and removal
+of that marker are one later state write. A watcher treats any marker as pending
+work and cannot finalize the group. If `sbatch` times out or the submitter dies
+after submission but before the job ID is recorded, inspect Slurm and the group
+state, then explicitly reconcile the marker:
+
+```text
+paseo-slurm group repair GROUP_ID --submission TOKEN --job-id ID [--sentinel PATH] [--array]
+paseo-slurm group repair GROUP_ID --submission TOKEN --drop-submission
+```
+
+Use `--drop-submission` only after independently establishing that no job was
+created. A known nonzero `sbatch` exit removes its marker automatically; an
+invocation error is retained as ambiguous.
 
 The first `submit` sets the agent's reserved
 `paseo.external-wait-id` label, so a compatible Paseo daemon keeps the original
@@ -161,6 +200,13 @@ clears the label before resuming the child; the parent is notified when that
 final child turn finishes. An intermediate turn may add follow-up jobs to the
 same `each` group.
 
+Group add, repair, cancel, watcher item mutation, and callback finalization are
+serialized by the same per-agent transition. Final delivery first commits a
+non-appendable `finalizing` state, rereads the group, and recomputes finality.
+It will not clear the label, complete, or release ownership while any item or
+pending submission remains. An intermediate `each` callback marks only its
+terminal items notified and retains the same claim and label.
+
 Use `--mode all` when the agent should resume only after every job is terminal.
 Jobs cannot be added to an `all` group after watching begins.
 
@@ -176,14 +222,46 @@ paseo-slurm group add GROUP_ID --job-id ID [options]
 paseo-slurm group wait GROUP_ID
 paseo-slurm group status [GROUP_ID]
 paseo-slurm group cancel GROUP_ID
+paseo-slurm group repair GROUP_ID --submission TOKEN
+                         (--job-id ID [--sentinel PATH] [--array] |
+                          --drop-submission)
 paseo-slurm recover
 paseo-slurm cancel REGISTRATION_ID
+paseo-slurm abandon --wait-id ID --generation TOKEN [--agent-id ID]
+                     [--paseo-bin PATH]
 ```
 
 Group state, registration state, and logs are stored beneath
 `${XDG_STATE_HOME:-~/.local/state}/paseo-slurm`. `recover` and `group wait`
-must run next to the compute-node daemon, not on kestrel. The compute launch
-script reattaches `watching` groups after the daemon is healthy.
+must run next to the compute-node daemon, not on the `kestrel` login host. The
+compute launch script reattaches `watching` groups after the daemon is healthy.
+Recovery
+adopts an existing controller's exact claim and atomically starts at most one
+replacement generation. It restarts only a watcher or a conclusively unsent
+terminal callback path; it never resubmits a Slurm job or reruns a local
+command.
+
+Recovery releases a matching leftover claim when the durable record is already
+conclusively `resumed`, `completed`, `cancelled`, or `abandoned`. This covers a
+crash after final persistence but before release without sending twice. A
+Slurm `preparing` record contains enough data to restore its label transition;
+a local `preparing` record is marked `lost` and its payload is never launched by
+recovery. A claim with no state record is the protected claim-before-state crash
+window: `recover` reports it as `ORPHAN_EXTERNAL_WAIT` with its exact agent,
+wait ID, kind, and generation, but never deletes it based on age. A `finalizing`
+record, an intermediate group in `callback_ambiguous`, an interrupted
+cancellation, or a submit marker whose Slurm outcome is unknown is also
+intentionally not guessed. If such an active record has lost its claim,
+`recover` republishes the exact generation already stored in the record and
+reports it for inspection; it still never resends the callback automatically.
+
+After checking Paseo, Slurm, and any local payload, an operator may use the
+appropriate `abandon` command with the exact reported generation. Abandon
+refuses a mismatched claim and refuses a state record with a live controller
+(or live local payload), fences the record when present, clears the reserved
+label with the recorded or supplied Paseo binary, and releases the claim. This
+is a repair escape hatch, not automatic garbage collection. A missing,
+mismatched, or unconfirmed release is reported as an error.
 
 ## Paseo compatibility
 
@@ -234,3 +312,33 @@ packages.
 - Cancelling a registration stops monitoring; it does not run `scancel`.
 - `paseo-local cancel` signals only the recorded local process group; it never
   calls `scancel`.
+
+## Remaining limits
+
+- The transition protocol requires Linux `/proc`, `flock`, and one shared
+  `XDG_STATE_HOME` used by all cooperating updated `paseo-slurm` and
+  `paseo-local` processes. Its filesystem must provide advisory locks and
+  coherent atomic rename/link operations for every host allowed to control the
+  same agent. Older binaries and a second state root are outside the fence.
+- A CLI waits up to 30 seconds to acquire the per-agent transition lock. If a
+  current external operation holds it longer, the contender fails safely and
+  may be retried.
+- Paseo label update, `paseo send`, and the local state write are separate
+  external operations. A crash or timeout after a send starts but before its
+  result is durably committed is ambiguous. A final callback remains
+  `finalizing`; an intermediate `each` callback becomes `callback_ambiguous`.
+  Recovery will not send either again, because that could duplicate a
+  callback; inspect and explicitly abandon or repair it.
+- If a local runner dies after launching a payload but before persisting the
+  child's PID, recovery will not rerun it and cannot prove that the unrecorded
+  payload stopped. Inspect the node before using `paseo-local abandon`.
+- Exact PID/start identity lets cancellation terminate current controllers.
+  Legacy records without a start identity are still durably generation-fenced,
+  but the process is not signalled by PID because that could hit a reused PID.
+- Kernel locks disappear on process death; their ordinary lock files are
+  intentionally persistent and harmless. A hard-killed caller can leave a
+  uniquely named readiness marker. No marker or claim is auto-deleted merely
+  because it is old.
+- Processes that manually edit state, delete claims, or mutate the reserved
+  Paseo label outside this protocol can defeat its guarantees. `abandon` and
+  group submission repair are the supported ownership-checked repair paths.
