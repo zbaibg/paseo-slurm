@@ -1,8 +1,13 @@
-# paseo-slurm
+# paseo-slurm and paseo-local
 
 `paseo-slurm` waits for Slurm jobs outside the AI model and resumes the same
 [Paseo](https://github.com/getpaseo/paseo) agent when the job reaches a terminal
 state. Scheduler polling therefore consumes no model tokens.
+
+The same package installs a separate `paseo-local` command for a long process
+that is intentionally running directly on the Paseo compute node. Keeping the
+commands separate makes the execution choice explicit: `paseo-local` is not a
+way to bypass Slurm for production or multi-node scientific work.
 
 This is an independent sidecar: its runtime does not embed or fork Paseo.
 Parent-finish deferral (`paseo.external-wait-id`) still needs either upstream
@@ -41,6 +46,52 @@ must stay on the same compute node as that daemon so `paseo send` can resume
 agents. After a patched Paseo install, load the new server the same way:
 stop any leftover login-node daemon, then submit this script again (cancel the
 previous `paseo-daemon` job first if one is still running).
+
+## Wait for one local process
+
+Use `paseo-local` only after the task has already been classified as suitable
+for direct execution on the current compute node: for example, one incremental
+build or a focused test in an active scientific-software development workspace.
+Keep short commands in the foreground. Use `paseo-slurm` for scheduler-sized,
+multi-node, production, or scientific-computation workloads.
+
+```bash
+paseo-local run \
+  --cwd /scratch/zbai29/my-project \
+  --stdout /scratch/zbai29/my-project/logs/ctest.out \
+  --stderr /scratch/zbai29/my-project/logs/ctest.err \
+  --resume-prompt "Inspect the final CTest result once." \
+  -- ctest --test-dir build --output-on-failure
+```
+
+`run` launches the command once and prints `WAITING_LOCAL_TASK`. The calling
+agent must end its turn immediately after that marker; it must not follow with
+`sleep`, `tail`, `pgrep`, or repeated status checks. A detached, non-AI runner
+waits for the process, records its exit status, waits for the agent to park, and
+sends one internal system callback.
+
+The command is executed directly as an argument array. Use an explicit
+`bash -lc` only when shell syntax is genuinely required. Put noisy stdout and
+stderr on node-local scratch; the default logs under the state directory are
+appropriate only for small output. Useful commands are:
+
+```text
+paseo-local run [options] -- COMMAND [ARGS...]
+paseo-local wait [TASK_ID]
+paseo-local status [TASK_ID]
+paseo-local cancel TASK_ID [--signal SIGTERM]
+paseo-local recover
+```
+
+`cancel` terminates the detached process group and still emits a final
+`CANCELLED` callback. State is stored beneath
+`${XDG_STATE_HOME:-~/.local/state}/paseo-local`. `recover` retries callbacks for
+tasks that already have a terminal result; it does not guess the outcome of an
+orphaned process.
+
+One agent may own only one external wait controller at a time. Both commands
+refuse to start if that agent already has an active wait owned by the other
+command.
 
 ## Submit and wait
 
@@ -181,3 +232,5 @@ packages.
   `--sentinel off` for non-shell batch scripts.
 - Registration files are written atomically with user-only permissions.
 - Cancelling a registration stops monitoring; it does not run `scancel`.
+- `paseo-local cancel` signals only the recorded local process group; it never
+  calls `scancel`.

@@ -202,6 +202,30 @@ function activeRegistrationForAgent(agentId: string): Registration | undefined {
     );
 }
 
+function activeLocalWaitIdForAgent(agentId: string): string | undefined {
+  const directory = join(dirname(stateRoot()), "paseo-local", "tasks");
+  if (!existsSync(directory)) return undefined;
+  return readdirSync(directory)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => JSON.parse(readFileSync(join(directory, name), "utf8")) as {
+      id: string;
+      agentId: string;
+      status: string;
+    })
+    .find(
+      (task) =>
+        task.agentId === agentId &&
+        [
+          "starting",
+          "watching",
+          "terminal",
+          "resume_failed",
+          "cancel_requested",
+          "lost",
+        ].includes(task.status),
+    )?.id;
+}
+
 function createGroupRecord(options: {
   agentId: string;
   mode: WaitGroupMode;
@@ -217,6 +241,12 @@ function createGroupRecord(options: {
   if (activeRegistration) {
     throw new Error(
       `agent ${options.agentId} already owns active registration ${activeRegistration.id}; cancel or finish it before creating a group`,
+    );
+  }
+  const activeLocalWaitId = activeLocalWaitIdForAgent(options.agentId);
+  if (activeLocalWaitId) {
+    throw new Error(
+      `agent ${options.agentId} already owns active paseo-local task ${activeLocalWaitId}; finish it before creating a Slurm group`,
     );
   }
   const now = new Date().toISOString();
@@ -1018,6 +1048,12 @@ function submit(argv: string[]): void {
 function register(args: ParsedArgs): void {
   const agentId = stringOption(args, "agent-id") || process.env.PASEO_AGENT_ID?.trim();
   if (!agentId) throw new Error("--agent-id is required outside a Paseo agent");
+  const activeLocalWaitId = activeLocalWaitIdForAgent(agentId);
+  if (activeLocalWaitId) {
+    throw new Error(
+      `agent ${agentId} already owns active paseo-local task ${activeLocalWaitId}; finish it before registering a Slurm wait`,
+    );
+  }
   const jobId = validateJobId(requiredOption(args, "job-id"));
   const arrayJob = isSlurmArrayJob(jobId);
   const sentinelPath = arrayJob ? undefined : stringOption(args, "sentinel");

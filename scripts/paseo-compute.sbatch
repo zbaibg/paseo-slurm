@@ -14,8 +14,8 @@
 #   sbatch /home/zbai29/soft/paseo-slurm/scripts/paseo-compute.sbatch
 # One Paseo daemon on the Human-fixed host compute-0-40. Same ~/.paseo on NFS;
 # do not start a second daemon on kestrel. After the daemon is healthy,
-# reattach watching paseo-slurm groups on this node so resume talks to this
-# daemon.
+# reattach watching paseo-slurm groups and retry completed paseo-local callbacks
+# on this node so resume talks to this daemon.
 
 set -euo pipefail
 
@@ -37,6 +37,7 @@ export NVM_DIR="${HOME}/.nvm"
 command -v node >/dev/null
 command -v paseo >/dev/null
 command -v paseo-slurm >/dev/null
+command -v paseo-local >/dev/null
 
 export TMPDIR="${PASEO_TMPDIR:-/home/zbai29/soft/tmp}"
 export TMP="${TMPDIR}"
@@ -52,7 +53,7 @@ if [[ "${local_daemon}" != "stopped" && -n "${local_daemon}" ]]; then
 fi
 
 echo "host=${host} job=${SLURM_JOB_ID} ntasks=${SLURM_NTASKS} node=${SLURM_JOB_NODELIST}"
-echo "paseo=$(command -v paseo) paseo-slurm=$(command -v paseo-slurm) node=$(command -v node)"
+echo "paseo=$(command -v paseo) paseo-slurm=$(command -v paseo-slurm) paseo-local=$(command -v paseo-local) node=$(command -v node)"
 echo "TMPDIR=${TMPDIR}"
 paseo --version || true
 
@@ -104,6 +105,7 @@ for group_id in "${watching_groups[@]+"${watching_groups[@]}"}"; do
   echo "reattach paseo-slurm group ${group_id}"
   paseo-slurm group wait "${group_id}"
 done
+paseo-local recover
 
 echo "paseo daemon pid=${daemon_pid} watching_groups=${#watching_groups[@]}"
 wait "${daemon_pid}"

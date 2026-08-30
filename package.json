@@ -1,10 +1,11 @@
 {
   "name": "paseo-slurm",
-  "version": "0.4.0",
-  "description": "Token-free Slurm completion watcher that resumes Paseo agents",
+  "version": "0.5.0",
+  "description": "Token-free Slurm and local-process completion watchers for Paseo agents",
   "type": "module",
   "bin": {
-    "paseo-slurm": "./dist/src/cli.js"
+    "paseo-slurm": "./dist/src/cli.js",
+    "paseo-local": "./dist/src/local-cli.js"
   },
   "files": [
     "dist",
