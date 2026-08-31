@@ -40,7 +40,8 @@ run `paseo daemon start` or `paseo daemon restart` on kestrel. The launch
 script sets `TMPDIR=/home/zbai29/soft/tmp` itself:
 
 ```bash
-# cancel an existing paseo-daemon job first if one is still running
+# cancel an existing paseo-daemon job first if one is still running.
+# The launch script clears leftover ~/.paseo/paseo.pid and a still-bound :6767.
 sbatch ./scripts/paseo-compute.sbatch
 ```
 

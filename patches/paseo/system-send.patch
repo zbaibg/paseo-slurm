@@ -1,30 +1,18 @@
-From local/main-external-wait-tmpdir Mon Sep 17 00:00:00 2001
+From local/paseo-v0.7.0-companion Mon Sep 17 00:00:00 2001
 From: zbai29 <zbai29@wisc.edu>
-Date: Wed, 19 Aug 2026 16:40:00 -0500
+Date: Mon, 31 Aug 2026 22:54:16 +0000
 Subject: [PATCH] Add paseo send --system for external-wait resumes
 
 Incremental on top of the finish-deferral companion patch. Vanilla checkouts
 should apply external-wait-finish-deferral.patch instead (it already includes
 this).
 
-Rebased onto getpaseo/paseo v0.5.0-beta.4 plus finish deferral.
+Rebased onto getpaseo/paseo v0.7.0 plus finish deferral.
+
+Rebased onto getpaseo/paseo v0.7.0 (c56638ea8).
 
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
-diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
-index 53f04bf30..0851a8062 100644
---- a/docs/agent-lifecycle.md
-+++ b/docs/agent-lifecycle.md
-@@ -80,6 +80,9 @@ The label marks an external controller's ownership; Paseo does not interpret the
- the external system, group membership, or completion strategy. The controller must serialize its
- state transitions and completion prompts. Errors and permission requests still notify the caller
- immediately. Clearing the label while the child is idle does not itself complete the delegated task.
-+External controllers should resume the child with `paseo send --system`; this uses the same hidden
-+system-context path as child-to-parent finish notifications instead of adding a user-message bubble
-+to the timeline.
- Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
- The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
- A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.
 diff --git a/packages/cli/src/commands/agent/send.ts b/packages/cli/src/commands/agent/send.ts
 index 06249289b..39949f062 100644
 --- a/packages/cli/src/commands/agent/send.ts
@@ -55,10 +43,10 @@ index 06249289b..39949f062 100644
      // If --no-wait, return immediately
      if (options.wait === false) {
 diff --git a/packages/client/src/daemon-client.ts b/packages/client/src/daemon-client.ts
-index 5e07dc1f2..5b5a01dd8 100644
+index 0a194da2f..9cf72f541 100644
 --- a/packages/client/src/daemon-client.ts
 +++ b/packages/client/src/daemon-client.ts
-@@ -340,6 +340,7 @@ export interface DaemonClientTrace {
+@@ -342,6 +342,7 @@ export interface DaemonClientTrace {
  
  export interface SendMessageOptions {
    messageId?: string;
@@ -66,7 +54,7 @@ index 5e07dc1f2..5b5a01dd8 100644
    activeTurnBehavior?: ActiveTurnBehavior;
    images?: Array<{ data: string; mimeType: string }>;
    attachments?: SendAgentMessageRequest["attachments"];
-@@ -3040,13 +3041,14 @@ export class DaemonClient {
+@@ -3043,13 +3044,14 @@ export class DaemonClient {
      options?: SendMessageOptions,
    ): Promise<void> {
      const requestId = this.createRequestId();
@@ -83,10 +71,10 @@ index 5e07dc1f2..5b5a01dd8 100644
        ...(options?.images ? { images: options.images } : {}),
        ...(options?.attachments ? { attachments: options.attachments } : {}),
 diff --git a/packages/client/src/index.test.ts b/packages/client/src/index.test.ts
-index 6d6b2e826..f3e5b214e 100644
+index 50de0f2f9..4ee81efd1 100644
 --- a/packages/client/src/index.test.ts
 +++ b/packages/client/src/index.test.ts
-@@ -558,6 +558,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
+@@ -631,6 +631,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
    );
    await sendPromise;
  
@@ -116,10 +104,10 @@ index 6d6b2e826..f3e5b214e 100644
      messageId: "run-message-sdk",
      timeoutMs: 30_000,
 diff --git a/packages/client/src/index.ts b/packages/client/src/index.ts
-index 6a308cd29..dae3c87f0 100644
+index 268e200ab..8dfd69004 100644
 --- a/packages/client/src/index.ts
 +++ b/packages/client/src/index.ts
-@@ -215,6 +215,7 @@ export interface PaseoAgentTimelineRefetchOptions {
+@@ -228,6 +228,7 @@ export interface PaseoAgentTimelineRefetchOptions {
  
  export interface PaseoAgentSendOptions {
    messageId?: string;
@@ -155,10 +143,10 @@ index 015164f70..fc13ed9d1 100644
    test("old-shaped fetch_workspaces_response without project still parses", () => {
      const parsed = SessionOutboundMessageSchema.parse(
 diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
-index dbceccd0a..3e544a10d 100644
+index 35dd1e8ad..a0f901f36 100644
 --- a/packages/protocol/src/messages.ts
 +++ b/packages/protocol/src/messages.ts
-@@ -1201,6 +1201,7 @@ export const SendAgentMessageSchema = z.object({
+@@ -1221,6 +1221,7 @@ export const SendAgentMessageSchema = z.object({
    agentId: z.string(),
    text: z.string(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
@@ -166,7 +154,7 @@ index dbceccd0a..3e544a10d 100644
    activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
-@@ -1354,6 +1355,7 @@ export const SendAgentMessageRequestSchema = z.object({
+@@ -1374,6 +1375,7 @@ export const SendAgentMessageRequestSchema = z.object({
    agentId: z.string(),
    text: z.string(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
@@ -175,7 +163,7 @@ index dbceccd0a..3e544a10d 100644
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
 diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
-index 014d3e727..f6173290c 100644
+index 21a134f54..214a46f4c 100644
 --- a/packages/server/src/server/session.ts
 +++ b/packages/server/src/server/session.ts
 @@ -41,6 +41,8 @@ import {
@@ -187,7 +175,7 @@ index 014d3e727..f6173290c 100644
    sendPromptToAgent,
    waitForAgentRunStartWithTimeout,
    unarchiveAgentState,
-@@ -7173,11 +7175,15 @@ export class Session {
+@@ -7322,11 +7324,15 @@ export class Session {
      try {
        const agentId = resolved.agentId;
  
@@ -205,7 +193,7 @@ index 014d3e727..f6173290c 100644
            activeTurnBehavior: msg.activeTurnBehavior,
            textPrefix: msg.text.slice(0, 80),
          },
-@@ -7190,8 +7196,8 @@ export class Session {
+@@ -7339,7 +7345,7 @@ export class Session {
            agentStorage: this.agentStorage,
            agentId,
            prompt,
@@ -214,4 +202,16 @@ index 014d3e727..f6173290c 100644
            activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
            clearPendingPermissions: true,
            logger: this.sessionLogger,
-         });
+diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
+--- a/docs/agent-lifecycle.md
++++ b/docs/agent-lifecycle.md
+@@ -80,6 +80,9 @@ The label marks an external controller's ownership; Paseo does not interpret the
+ the external system, group membership, or completion strategy. The controller must serialize its
+ state transitions and completion prompts. Errors and permission requests still notify the caller
+ immediately. Clearing the label while the child is idle does not itself complete the delegated task.
++External controllers should resume the child with `paseo send --system`; this uses the same hidden
++system-context path as child-to-parent finish notifications instead of adding a user-message bubble
++to the timeline.
+ Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
+ The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
+ A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.

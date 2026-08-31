@@ -1,6 +1,6 @@
-From local/codex-reload-close-before-resume Mon Sep 17 00:00:00 2001
+From local/paseo-v0.7.0-companion Mon Sep 17 00:00:00 2001
 From: zbai29 <zbai29@wisc.edu>
-Date: Wed, 19 Aug 2026 20:26:00 -0500
+Date: Mon, 31 Aug 2026 22:54:16 +0000
 Subject: [PATCH] Close previous session before Codex reload resume
 
 Paseo reload spawned a replacement Codex app-server and called
@@ -9,14 +9,17 @@ thread writer. Close and wait for the old session first. If the
 replacement then fails, keep the agent visible in error and block
 startTurn until a later reload succeeds.
 
-Independent of the external-wait patches. Verified against
-getpaseo/paseo v0.5.0-beta.2 (ccd991b3e). Matches getpaseo/paseo#3574.
+Independent of the external-wait patches. Matches getpaseo/paseo#3574.
+
+Rebased onto getpaseo/paseo v0.7.0 (c56638ea8).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
 diff --git a/packages/server/src/server/agent/agent-manager.test.ts b/packages/server/src/server/agent/agent-manager.test.ts
-index 7331688f6..8ba8e237e 100644
+index 4293f7210..e0e25ee66 100644
 --- a/packages/server/src/server/agent/agent-manager.test.ts
 +++ b/packages/server/src/server/agent/agent-manager.test.ts
-@@ -1082,6 +1082,12 @@ class McpCapableTestAgentSession extends TestAgentSession {
+@@ -528,6 +528,12 @@ class McpCapableTestAgentSession extends TestAgentSession {
  
  class CloseRecordingTestAgentSession extends TestAgentSession {
    closed = false;
@@ -29,11 +32,10 @@ index 7331688f6..8ba8e237e 100644
  
    override async close(): Promise<void> {
      this.closed = true;
-@@ -3017,6 +3023,73 @@ test("setAgentMode persists the selected mode across session reload", async () =
+@@ -2244,6 +2250,72 @@ test("setAgentMode persists the selected mode across session reload", async () =
    expect(reloaded.currentModeId).toBe("full-access");
  });
  
-+
 +test("reloadAgentSession closes the previous session before resuming the replacement", async () => {
 +  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reload-close-before-resume-"));
 +  const storagePath = join(workdir, "agents");
@@ -103,7 +105,7 @@ index 7331688f6..8ba8e237e 100644
  test("reloadAgentSession completes when the previous session close hangs", async () => {
    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reload-close-timeout-"));
    const storagePath = join(workdir, "agents");
-@@ -3543,10 +3616,11 @@ test("resumeAgentFromPersistence closes and rejects a session that cannot honor
+@@ -2770,10 +2842,11 @@ test("resumeAgentFromPersistence closes and rejects a session that cannot honor
    }
  });
  
@@ -116,7 +118,7 @@ index 7331688f6..8ba8e237e 100644
  
    class UnsupportedReloadClient extends TestAgentClient {
      override async createSession(): Promise<AgentSession> {
-@@ -3560,7 +3634,7 @@ test("reloadAgentSession preserves the live session when its replacement cannot
+@@ -2787,7 +2860,7 @@ test("reloadAgentSession preserves the live session when its replacement cannot
  
    const manager = new AgentManager({
      clients: { codex: new UnsupportedReloadClient() },
@@ -125,7 +127,7 @@ index 7331688f6..8ba8e237e 100644
      logger,
    });
  
-@@ -3580,9 +3654,143 @@ test("reloadAgentSession preserves the live session when its replacement cannot
+@@ -2807,9 +2880,143 @@ test("reloadAgentSession preserves the live session when its replacement cannot
      ).rejects.toThrow("Provider 'codex' does not support MCP servers");
  
      expect(replacement.closed).toBe(true);
@@ -273,10 +275,10 @@ index 7331688f6..8ba8e237e 100644
      rmSync(workdir, { recursive: true, force: true });
    }
 diff --git a/packages/server/src/server/agent/agent-manager.ts b/packages/server/src/server/agent/agent-manager.ts
-index 9a1838a78..76ecb687b 100644
+index de256c795..e9a5d9079 100644
 --- a/packages/server/src/server/agent/agent-manager.ts
 +++ b/packages/server/src/server/agent/agent-manager.ts
-@@ -365,6 +365,12 @@ interface ManagedAgentBase {
+@@ -374,6 +374,12 @@ interface ManagedAgentBase {
    >;
    inFlightPermissionResponses: Set<string>;
    pendingReplacement: boolean;
@@ -289,7 +291,7 @@ index 9a1838a78..76ecb687b 100644
    persistence: AgentPersistenceHandle | null;
    historyPrimed: boolean;
    lastUserMessageAt: Date | null;
-@@ -1365,7 +1371,7 @@ export class AgentManager {
+@@ -1358,7 +1364,7 @@ export class AgentManager {
      const rehydrateFromDisk = options?.rehydrateFromDisk ?? false;
      const preservedHistoryPrimed = existing.historyPrimed;
      const preservedLastUsage = existing.lastUsage;
@@ -298,7 +300,7 @@ index 9a1838a78..76ecb687b 100644
      const preservedAttention = existing.attention;
      const handle = existing.persistence;
      const provider = handle?.provider ?? existing.provider;
-@@ -1379,22 +1385,32 @@ export class AgentManager {
+@@ -1372,22 +1378,32 @@ export class AgentManager {
      const launchContext = await this.buildLaunchContext(agentId, client, storedConfig.cwd);
      const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
  
@@ -340,8 +342,8 @@ index 9a1838a78..76ecb687b 100644
 +      await this.persistSnapshot(closedExisting);
  
        if (rehydrateFromDisk) {
-         // Wipe both durable and in-memory timeline so registerSession mints a
-@@ -1428,6 +1444,39 @@ export class AgentManager {
+         // Wipe the in-memory timeline so registerSession mints a new epoch and
+@@ -1419,6 +1435,39 @@ export class AgentManager {
      }
    }
  
@@ -381,7 +383,7 @@ index 9a1838a78..76ecb687b 100644
    private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
      try {
        const result = await this.waitWithTimeout({
-@@ -2160,6 +2209,11 @@ export class AgentManager {
+@@ -2183,6 +2232,11 @@ export class AgentManager {
      options?: AgentRunOptions,
    ): AsyncGenerator<AgentStreamEvent> {
      const existingAgent = this.requireSessionAgent(agentId);

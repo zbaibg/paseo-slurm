@@ -1,22 +1,23 @@
-From local/main-external-wait-tmpdir Mon Sep 17 00:00:00 2001
+From local/paseo-v0.7.0-companion Mon Sep 17 00:00:00 2001
 From: zbai29 <zbai29@wisc.edu>
-Date: Sat, 22 Aug 2026 16:00:00 -0500
+Date: Mon, 31 Aug 2026 22:54:16 +0000
 Subject: [PATCH] External-wait finish deferral and hidden system send
 
 Keep the original caller subscription alive across externally resumed work,
 and let controllers resume with `paseo send --system` so the prompt uses the
 hidden <paseo-system> path instead of a user-message bubble.
 
-Rebased onto getpaseo/paseo v0.5.0-beta.4 (f660fcf2e). Does not include
-machine-local TMPDIR defaults.
+Does not include machine-local TMPDIR defaults.
+
+Rebased onto getpaseo/paseo v0.7.0 (c56638ea8).
 
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
 diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
-index 7e3d0913c..04f4b3414 100644
+index d9f971059..d4b9f9e92 100644
 --- a/docs/agent-lifecycle.md
 +++ b/docs/agent-lifecycle.md
-@@ -61,6 +61,28 @@ Runtime ownership is resolved from explicit workspace ID and caller context, nev
+@@ -70,6 +70,28 @@ Runtime ownership is resolved from explicit workspace ID and caller context, nev
  Users can also detach an existing subagent from the subagents track. Detach is deliberately a manual lifecycle gesture, not an agent-facing MCP tool. It removes the parent and open-tab lifecycle labels: it does not stop, archive, move, or restart the agent. The agent keeps its current `cwd` and `workspaceId`, leaves the former parent's track, and behaves like a root agent for tab close, workspace activity, and future parent archive.
  
  `notifyOnFinish` defaults to `true` for agent-scoped creation and background prompt follow-ups because most delegated work needs to report back to the creating agent. Set it to `false` only for truly fire-and-forget agents or prompts.
@@ -75,10 +76,10 @@ index 06249289b..39949f062 100644
      // If --no-wait, return immediately
      if (options.wait === false) {
 diff --git a/packages/client/src/daemon-client.ts b/packages/client/src/daemon-client.ts
-index 5e07dc1f2..5b5a01dd8 100644
+index 0a194da2f..9cf72f541 100644
 --- a/packages/client/src/daemon-client.ts
 +++ b/packages/client/src/daemon-client.ts
-@@ -340,6 +340,7 @@ export interface DaemonClientTrace {
+@@ -342,6 +342,7 @@ export interface DaemonClientTrace {
  
  export interface SendMessageOptions {
    messageId?: string;
@@ -86,7 +87,7 @@ index 5e07dc1f2..5b5a01dd8 100644
    activeTurnBehavior?: ActiveTurnBehavior;
    images?: Array<{ data: string; mimeType: string }>;
    attachments?: SendAgentMessageRequest["attachments"];
-@@ -3040,13 +3041,14 @@ export class DaemonClient {
+@@ -3043,13 +3044,14 @@ export class DaemonClient {
      options?: SendMessageOptions,
    ): Promise<void> {
      const requestId = this.createRequestId();
@@ -103,10 +104,10 @@ index 5e07dc1f2..5b5a01dd8 100644
        ...(options?.images ? { images: options.images } : {}),
        ...(options?.attachments ? { attachments: options.attachments } : {}),
 diff --git a/packages/client/src/index.test.ts b/packages/client/src/index.test.ts
-index 6d6b2e826..f3e5b214e 100644
+index 50de0f2f9..4ee81efd1 100644
 --- a/packages/client/src/index.test.ts
 +++ b/packages/client/src/index.test.ts
-@@ -558,6 +558,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
+@@ -631,6 +631,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
    );
    await sendPromise;
  
@@ -136,10 +137,10 @@ index 6d6b2e826..f3e5b214e 100644
      messageId: "run-message-sdk",
      timeoutMs: 30_000,
 diff --git a/packages/client/src/index.ts b/packages/client/src/index.ts
-index 6a308cd29..dae3c87f0 100644
+index 268e200ab..8dfd69004 100644
 --- a/packages/client/src/index.ts
 +++ b/packages/client/src/index.ts
-@@ -215,6 +215,7 @@ export interface PaseoAgentTimelineRefetchOptions {
+@@ -228,6 +228,7 @@ export interface PaseoAgentTimelineRefetchOptions {
  
  export interface PaseoAgentSendOptions {
    messageId?: string;
@@ -222,10 +223,10 @@ index 015164f70..fc13ed9d1 100644
    test("old-shaped fetch_workspaces_response without project still parses", () => {
      const parsed = SessionOutboundMessageSchema.parse(
 diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
-index bcc9c5845..e0a225cc0 100644
+index 35dd1e8ad..a0f901f36 100644
 --- a/packages/protocol/src/messages.ts
 +++ b/packages/protocol/src/messages.ts
-@@ -1201,6 +1201,7 @@ export const SendAgentMessageSchema = z.object({
+@@ -1221,6 +1221,7 @@ export const SendAgentMessageSchema = z.object({
    agentId: z.string(),
    text: z.string(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
@@ -233,7 +234,7 @@ index bcc9c5845..e0a225cc0 100644
    activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
-@@ -1354,6 +1355,7 @@ export const SendAgentMessageRequestSchema = z.object({
+@@ -1374,6 +1375,7 @@ export const SendAgentMessageRequestSchema = z.object({
    agentId: z.string(),
    text: z.string(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
@@ -242,17 +243,18 @@ index bcc9c5845..e0a225cc0 100644
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
 diff --git a/packages/server/src/server/agent/agent-prompt.test.ts b/packages/server/src/server/agent/agent-prompt.test.ts
-index 89b175d13..f3ded2614 100644
+index 864813a14..f6321d764 100644
 --- a/packages/server/src/server/agent/agent-prompt.test.ts
 +++ b/packages/server/src/server/agent/agent-prompt.test.ts
-@@ -1,5 +1,6 @@
- import { expect, it, test, vi } from "vitest";
- import pino, { type Logger } from "pino";
+@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
+ import { mkdtempSync, rmSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
 +import { EXTERNAL_WAIT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
  
  import { createTestLogger } from "../../test-utils/test-logger.js";
  import { AgentManager } from "./agent-manager.js";
-@@ -45,6 +46,7 @@ interface FinishNotificationScenarioOptions {
+@@ -56,6 +57,7 @@ interface FinishNotificationScenarioOptions {
  
  interface FinishNotificationScenario {
    startWatchingChild(): void;
@@ -260,7 +262,7 @@ index 89b175d13..f3ded2614 100644
    requestChildPermission(requestId?: string): void;
    resolveChildPermission(requestId?: string): void;
    resolveChildPermissionFromState(requestId?: string): void;
-@@ -70,6 +72,7 @@ function createFinishNotificationScenario(
+@@ -81,6 +83,7 @@ function createFinishNotificationScenario(
    Reflect.set(childAgent, "id", "child-agent");
    Reflect.set(childAgent, "lifecycle", "idle");
    Reflect.set(childAgent, "config", { title: "Child Agent" });
@@ -268,7 +270,7 @@ index 89b175d13..f3ded2614 100644
    Reflect.set(childAgent, "pendingPermissions", new Map());
  
    const callerAgent: ManagedAgent = Object.create(null);
-@@ -127,6 +130,13 @@ function createFinishNotificationScenario(
+@@ -138,6 +141,13 @@ function createFinishNotificationScenario(
    });
  
    return {
@@ -282,7 +284,7 @@ index 89b175d13..f3ded2614 100644
      startWatchingChild() {
        setupFinishNotification({
          agentManager,
-@@ -398,6 +408,38 @@ test("finish notifications survive repeated permission cycles", async () => {
+@@ -409,6 +419,38 @@ test("finish notifications survive repeated permission cycles", async () => {
    ).toEqual(["needs permission", "needs permission", "finished"]);
  });
  
@@ -322,7 +324,7 @@ index 89b175d13..f3ded2614 100644
    const scenario = createFinishNotificationScenario({
      childParentAgentId: null,
 diff --git a/packages/server/src/server/agent/agent-prompt.ts b/packages/server/src/server/agent/agent-prompt.ts
-index 07c7b4f57..27c594fe1 100644
+index 96f5ce5ee..6c6a0ecc0 100644
 --- a/packages/server/src/server/agent/agent-prompt.ts
 +++ b/packages/server/src/server/agent/agent-prompt.ts
 @@ -8,7 +8,10 @@ import type {
@@ -337,7 +339,7 @@ index 07c7b4f57..27c594fe1 100644
  import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
  
  export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
-@@ -452,6 +455,10 @@ export function setupFinishNotification(params: SetupFinishNotificationParams):
+@@ -473,6 +476,10 @@ export function setupFinishNotification(params: SetupFinishNotificationParams):
            return;
          }
          if (event.agent.lifecycle === "idle" && hasSeenRunning) {
@@ -349,7 +351,7 @@ index 07c7b4f57..27c594fe1 100644
            return;
          }
 diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
-index b0ebb7f24..b6c533e12 100644
+index 21a134f54..214a46f4c 100644
 --- a/packages/server/src/server/session.ts
 +++ b/packages/server/src/server/session.ts
 @@ -41,6 +41,8 @@ import {
@@ -361,7 +363,7 @@ index b0ebb7f24..b6c533e12 100644
    sendPromptToAgent,
    waitForAgentRunStartWithTimeout,
    unarchiveAgentState,
-@@ -7176,11 +7178,15 @@ export class Session {
+@@ -7322,11 +7324,15 @@ export class Session {
      try {
        const agentId = resolved.agentId;
  
@@ -379,7 +381,7 @@ index b0ebb7f24..b6c533e12 100644
            activeTurnBehavior: msg.activeTurnBehavior,
            textPrefix: msg.text.slice(0, 80),
          },
-@@ -7193,7 +7199,7 @@ export class Session {
+@@ -7339,7 +7345,7 @@ export class Session {
            agentStorage: this.agentStorage,
            agentId,
            prompt,

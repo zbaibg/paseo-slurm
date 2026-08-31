@@ -1,20 +1,23 @@
-From local/codex-rewind-runtime-mcp Mon Sep 17 00:00:00 2001
+From local/paseo-v0.7.0-companion Mon Sep 17 00:00:00 2001
 From: zbai29 <zbai29@wisc.edu>
-Date: Wed, 19 Aug 2026 17:15:00 -0500
+Date: Mon, 31 Aug 2026 22:54:16 +0000
 Subject: [PATCH] Pass runtime Codex config through rewind thread/fork
 
 Codex rewind used thread/fork without the runtime-injected mcp_servers
 overlay. The forked thread stays loaded, so thread/resume never restores
 Paseo's daemon MCP endpoint (getpaseo/paseo#3205).
 
-Independent of the external-wait and reload patches. Verified against
-getpaseo/paseo v0.5.0-beta.2 (ccd991b3e).
+Independent of the external-wait and reload patches.
+
+Rebased onto getpaseo/paseo v0.7.0 (c56638ea8).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
 diff --git a/packages/server/src/server/agent/providers/codex-app-server-agent.test.ts b/packages/server/src/server/agent/providers/codex-app-server-agent.test.ts
-index a3cc15b54..2c0e9e704 100644
+index 664af04f3..f57e080cf 100644
 --- a/packages/server/src/server/agent/providers/codex-app-server-agent.test.ts
 +++ b/packages/server/src/server/agent/providers/codex-app-server-agent.test.ts
-@@ -1457,6 +1457,50 @@ describe("Codex app-server provider", () => {
+@@ -1669,6 +1669,50 @@ describe("Codex app-server provider", () => {
      await session.close();
    });
  
@@ -66,10 +69,10 @@ index a3cc15b54..2c0e9e704 100644
      const appServer = createFakeCodexAppServer();
      const session = new CodexAppServerAgentSession(
 diff --git a/packages/server/src/server/agent/providers/codex-app-server-agent.ts b/packages/server/src/server/agent/providers/codex-app-server-agent.ts
-index 18df2d8e5..47805640b 100644
+index b38bc6910..257dc931d 100644
 --- a/packages/server/src/server/agent/providers/codex-app-server-agent.ts
 +++ b/packages/server/src/server/agent/providers/codex-app-server-agent.ts
-@@ -4548,6 +4548,10 @@ export class CodexAppServerAgentSession implements AgentSession {
+@@ -4648,6 +4648,10 @@ export class CodexAppServerAgentSession implements AgentSession {
        await this.ensureThread();
      }
  
@@ -80,7 +83,7 @@ index 18df2d8e5..47805640b 100644
      await revertCodexConversation({
        client: this.client,
        threadId: this.currentThreadId,
-@@ -4555,6 +4559,8 @@ export class CodexAppServerAgentSession implements AgentSession {
+@@ -4655,6 +4659,8 @@ export class CodexAppServerAgentSession implements AgentSession {
        cwd: this.config.cwd ?? null,
        model: this.config.model ?? null,
        serviceTier: this.serviceTier,

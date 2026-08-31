@@ -42,7 +42,9 @@ Start the daemon only by submitting the compute-node job from the login node:
 sbatch /home/zbai29/soft/paseo-slurm/scripts/paseo-compute.sbatch
 ```
 
-The batch script refuses to run on kestrel. Watchers spawned by `paseo-slurm`
+The batch script refuses to run on kestrel. It also clears a leftover
+`~/.paseo/paseo.pid` and any previous-job daemon still bound to
+`127.0.0.1:6767` on the allocated node. Watchers spawned by `paseo-slurm`
 must stay on the same compute node as that daemon so `paseo send` can resume
 agents. After a patched Paseo install, load the new server the same way:
 stop any leftover login-node daemon, then submit this script again (cancel the
