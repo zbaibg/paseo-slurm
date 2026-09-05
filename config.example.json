@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "accounting": {
+    "query_commands": [
+      ["sacct"],
+      [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "kestrel.local",
+        "sacct"
+      ]
+    ]
+  }
+}

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -12,13 +12,207 @@ import {
   buildSentinelWrapper,
   EXTERNAL_WAIT_ID_LABEL,
   hasArrayDirective,
+  loadAccountingQueryCommands,
   normalizeState,
   parsePaseoAgentStatus,
+  parsePaseoSlurmConfig,
   parseSacct,
   parseSentinel,
+  querySacct,
+  querySacctMany,
   selectGroupDispatch,
   validateJobId,
 } from "../src/cli.js";
+
+test("parses standalone accounting query command chains", () => {
+  assert.deepEqual(
+    parsePaseoSlurmConfig({
+      schema_version: 1,
+      accounting: {
+        query_commands: [
+          ["sacct"],
+          ["ssh", "-o", "BatchMode=yes", "kestrel.local", "sacct"],
+        ],
+      },
+    }),
+    [
+      ["sacct"],
+      ["ssh", "-o", "BatchMode=yes", "kestrel.local", "sacct"],
+    ],
+  );
+  assert.throws(
+    () => parsePaseoSlurmConfig({ schema_version: 1, accounting: { query_commands: ["sacct"] } }),
+    /argv array/,
+  );
+  assert.throws(
+    () => parsePaseoSlurmConfig({ schema_version: 1, accounting: { query_command: [["sacct"]] } }),
+    /unexpected accounting field/,
+  );
+});
+
+test("loads only the global standalone configuration file", () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-slurm-config-"));
+  const previous = process.env.XDG_CONFIG_HOME;
+  try {
+    const configDirectory = join(directory, "paseo-slurm");
+    mkdirSync(configDirectory, { recursive: true });
+    const path = join(configDirectory, "config.json");
+    writeFileSync(path, JSON.stringify({
+      schema_version: 1,
+      accounting: { query_commands: [["sacct"], ["remote-sacct"]] },
+    }));
+    process.env.XDG_CONFIG_HOME = directory;
+    assert.deepEqual(loadAccountingQueryCommands(), [["sacct"], ["remote-sacct"]]);
+  } finally {
+    if (previous === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("submit arms its group watcher without a separate wait command", () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-slurm-submit-arm-"));
+  let watcherPid: number | undefined;
+  try {
+    const bin = join(directory, "bin");
+    const stateHome = join(directory, "state");
+    mkdirSync(bin, { recursive: true });
+    const fakePaseo = join(bin, "fake-paseo");
+    writeFileSync(
+      fakePaseo,
+      "#!/usr/bin/env bash\nprintf '{}\\n'\n",
+      { mode: 0o700 },
+    );
+    const submitCount = join(directory, "submit-count");
+    writeFileSync(
+      join(bin, "sbatch"),
+      `#!/usr/bin/env bash\nif test -f ${JSON.stringify(submitCount)}; then printf '12346\\n'; else : >${JSON.stringify(submitCount)}; printf '12345\\n'; fi\n`,
+      { mode: 0o700 },
+    );
+    writeFileSync(join(bin, "scontrol"), "#!/usr/bin/env bash\nexit 1\n", { mode: 0o700 });
+    writeFileSync(join(bin, "sacct"), "#!/usr/bin/env bash\nprintf '12345|12345|RUNNING|0:0|00:00:01\\n'\n", { mode: 0o700 });
+    const script = join(directory, "job.sbatch");
+    writeFileSync(script, "#!/usr/bin/env bash\ntrue\n", { mode: 0o700 });
+    const cliPath = join(process.cwd(), "dist", "src", "cli.js");
+    const launched = spawnSync(
+      process.execPath,
+      [cliPath, "submit", "--mode", "all", "--agent-id", "agent-submit", "--paseo-bin", fakePaseo, "--", script],
+      {
+        encoding: "utf8",
+        env: { ...process.env, XDG_STATE_HOME: stateHome, PATH: `${bin}:${process.env.PATH ?? ""}` },
+      },
+    );
+    assert.equal(launched.status, 0, launched.stderr);
+    assert.match(launched.stdout, /^WAITING_SLURM_GROUP /);
+    const groupId = launched.stdout.match(/group_id=([^ ]+)/)?.[1];
+    watcherPid = Number(launched.stdout.match(/watcher_pid=([0-9]+)/)?.[1]);
+    assert.ok(groupId);
+    assert.ok(Number.isSafeInteger(watcherPid) && watcherPid > 0);
+    const second = spawnSync(
+      process.execPath,
+      [cliPath, "submit", "--mode", "all", "--agent-id", "agent-submit", "--paseo-bin", fakePaseo, "--", script],
+      {
+        encoding: "utf8",
+        env: { ...process.env, XDG_STATE_HOME: stateHome, PATH: `${bin}:${process.env.PATH ?? ""}` },
+      },
+    );
+    assert.equal(second.status, 0, second.stderr);
+    assert.match(second.stdout, new RegExp(`^WAITING_SLURM_GROUP group_id=${groupId} `));
+    assert.match(second.stdout, new RegExp(`watcher_pid=${watcherPid}(?:\\s|$)`));
+    const group = JSON.parse(
+      readFileSync(join(stateHome, "paseo-slurm", "groups", `${groupId}.json`), "utf8"),
+    ) as { status: string; watcherPid: number; items: Array<{ jobId: string }> };
+    assert.equal(group.status, "watching");
+    assert.equal(group.watcherPid, watcherPid);
+    assert.deepEqual(group.items.map((item) => item.jobId), ["12345", "12346"]);
+    process.kill(watcherPid, 0);
+  } finally {
+    if (watcherPid) {
+      try { process.kill(watcherPid, "SIGTERM"); } catch { /* already exited */ }
+    }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("falls back to the next accounting command only when the primary invocation fails", () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-slurm-accounting-"));
+  try {
+    const primary = join(directory, "primary");
+    const fallback = join(directory, "fallback");
+    writeFileSync(primary, "#!/usr/bin/env bash\nprintf 'local unavailable\\n' >&2\nexit 1\n", { mode: 0o700 });
+    writeFileSync(
+      fallback,
+      "#!/usr/bin/env bash\ntest \"$1\" = remote-prefix\nprintf '474672|474672|FAILED|0:53|00:00:00\\n'\n",
+      { mode: 0o700 },
+    );
+    assert.deepEqual(querySacct("474672", false, [[primary], [fallback, "remote-prefix"]]), {
+      state: "FAILED",
+      exitCode: "0:53",
+      elapsed: "00:00:00",
+      source: "sacct-fallback",
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("does not fall back when the primary accounting command succeeds without a terminal row", () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-slurm-accounting-pending-"));
+  try {
+    const primary = join(directory, "primary");
+    const fallback = join(directory, "fallback");
+    const fallbackMarker = join(directory, "fallback-ran");
+    writeFileSync(primary, "#!/usr/bin/env bash\nprintf '474672|474672|RUNNING|0:0|00:00:01\\n'\n", { mode: 0o700 });
+    writeFileSync(fallback, `#!/usr/bin/env bash\nprintf ran >${JSON.stringify(fallbackMarker)}\n`, { mode: 0o700 });
+    assert.equal(querySacct("474672", false, [[primary], [fallback]]), undefined);
+    assert.equal(spawnSync("test", ["-e", fallbackMarker]).status, 1);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("batches multiple jobs into one fallback query and demultiplexes mixed states", () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-slurm-accounting-batch-"));
+  try {
+    const primary = join(directory, "primary");
+    const fallback = join(directory, "fallback");
+    const observedArguments = join(directory, "arguments");
+    writeFileSync(primary, "#!/usr/bin/env bash\nexit 1\n", { mode: 0o700 });
+    writeFileSync(
+      fallback,
+      [
+        "#!/usr/bin/env bash",
+        "arguments=$1",
+        "shift",
+        "printf '%s\\n' \"$*\" >\"$arguments\"",
+        "printf '101|101|COMPLETED|0:0|00:00:02\\n'",
+        "printf '102|102|RUNNING|0:0|00:00:01\\n'",
+        "printf '103|103|FAILED|2:0|00:00:03\\n'",
+      ].join("\n"),
+      { mode: 0o700 },
+    );
+    const results = querySacctMany(
+      [{ jobId: "101" }, { jobId: "102" }, { jobId: "103" }],
+      [[primary], [fallback, observedArguments]],
+    );
+    assert.deepEqual(results.get("101"), {
+      state: "COMPLETED",
+      exitCode: "0:0",
+      elapsed: "00:00:02",
+      source: "sacct-fallback",
+    });
+    assert.equal(results.get("102"), undefined);
+    assert.deepEqual(results.get("103"), {
+      state: "FAILED",
+      exitCode: "2:0",
+      elapsed: "00:00:03",
+      source: "sacct-fallback",
+    });
+    assert.match(readFileSync(observedArguments, "utf8"), /-j 101,102,103/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("normalizes decorated Slurm states", () => {
   assert.equal(normalizeState("CANCELLED by 1234"), "CANCELLED");

@@ -23,6 +23,39 @@ support or the optional companion patch under `patches/paseo/` (see
 - A Paseo agent environment containing `PASEO_AGENT_ID`, or an explicit
   `--agent-id`
 
+## Configuration
+
+`paseo-slurm` reads `${XDG_CONFIG_HOME:-~/.config}/paseo-slurm/config.json`.
+This is the only configuration location; command-line and environment
+overrides are intentionally unsupported so every invocation uses the same
+site-owned accounting chain. When the file is absent, the default accounting
+command chain is simply `[["sacct"]]`.
+
+Accounting queries are direct argv prefixes. The watcher appends its validated
+`sacct` arguments to each prefix and tries the next command only when the
+current process cannot start, times out, or exits nonzero:
+
+```json
+{
+  "schema_version": 1,
+  "accounting": {
+    "query_commands": [
+      ["sacct"],
+      [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        "kestrel.local", "sacct"
+      ]
+    ]
+  }
+}
+```
+
+A successful query with no terminal allocation row means the job is not yet
+known to be terminal and does not invoke the fallback. The effective command
+chain is copied into each registration or group record so a detached watcher
+does not change behavior if the configuration file is edited later. Commands
+are spawned directly without a shell.
+
 ## Install
 
 ```bash
@@ -129,7 +162,6 @@ sentinel:
 paseo-slurm submit --mode each \
   --resume-prompt "Inspect the build result." \
   -- build.sbatch
-paseo-slurm wait
 ```
 
 The original batch script must be on a path visible from compute nodes; do not
@@ -151,17 +183,31 @@ Use `--drop-submission` only after independently establishing that no job was
 created. A known nonzero `sbatch` exit removes its marker automatically; an
 invocation error is retained as ambiguous.
 
-The first `submit` sets the agent's reserved
+Each successful `submit` sets the agent's reserved
 `paseo.external-wait-id` label, so a compatible Paseo daemon keeps the original
-parent finish subscription open without notifying the parent. `wait` starts a
-detached, non-AI watcher and prints `WAITING_SLURM_GROUP`; the calling agent
-must then end its run.
+parent finish subscription open without notifying the parent, starts or reuses
+the group's detached non-AI watcher, and prints `WAITING_SLURM_GROUP`; the
+calling agent must then end its run. Explicit `wait` remains only as a
+backward-compatible recovery command for an older or manually assembled group.
 
 The watcher uses Linux inotify directory events for low-latency sentinel
 detection, with a one-second `stat` fallback for shared filesystems such as
 CephFS. `sacct` runs every 60 seconds as the independent scheduler-state
 backup. A job submitted with `--sentinel off` has no file signal and therefore
 uses five-second `sacct` checks.
+
+If an accounting command fails, the watcher tries the next configured command.
+Terminal results obtained after the first command are reported with
+`source=sacct-fallback`. A failed attempt is not retried again until the normal
+accounting interval; it does not collapse into the one-second sentinel-stat
+cycle.
+
+Within one wait group, every job whose accounting check is due in the same
+watcher iteration is queried together with one comma-separated `-j` argument.
+The result is demultiplexed by job ID before the existing `each` or `all`
+dispatch logic runs. Different agents retain separate groups, controllers,
+claims, command snapshots, and callback targets; batching never crosses an
+agent boundary.
 
 Slurm arrays automatically disable the shared sentinel: one task must not mark
 the whole array complete. Arrays use the allocation's authoritative `sacct`

@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "config.example.json",
     "patches",
     "scripts",
     "README.md",

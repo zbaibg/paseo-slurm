@@ -46,8 +46,10 @@ export interface SlurmResult {
   state: string;
   exitCode: string;
   elapsed?: string;
-  source: "sacct" | "sentinel";
+  source: "sacct" | "sacct-fallback" | "sentinel";
 }
+
+export type AccountingQueryCommand = string[];
 
 export interface PaseoAgentStatus {
   status: string;
@@ -63,6 +65,7 @@ interface Registration {
   array?: boolean;
   intervalSeconds: number;
   sentinelPollSeconds?: number;
+  accountingQueryCommands?: AccountingQueryCommand[];
   resumePrompt?: string;
   paseoBin: string;
   createdAt: string;
@@ -109,6 +112,7 @@ export interface WaitGroup {
   mode: WaitGroupMode;
   intervalSeconds: number;
   sentinelPollSeconds?: number;
+  accountingQueryCommands?: AccountingQueryCommand[];
   paseoBin: string;
   createdAt: string;
   updatedAt: string;
@@ -135,6 +139,61 @@ export interface WaitGroup {
 interface ParsedArgs {
   positionals: string[];
   options: Map<string, string | boolean>;
+}
+
+const DEFAULT_ACCOUNTING_QUERY_COMMANDS: AccountingQueryCommand[] = [["sacct"]];
+
+export function parsePaseoSlurmConfig(config: unknown): AccountingQueryCommand[] {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw new Error("configuration must be a JSON object");
+  }
+  const record = config as Record<string, unknown>;
+  const unexpectedTopLevel = Object.keys(record).filter((key) => !["schema_version", "accounting"].includes(key));
+  if (unexpectedTopLevel.length > 0) {
+    throw new Error(`unexpected configuration field: ${unexpectedTopLevel[0]}`);
+  }
+  if (record.schema_version !== 1) throw new Error("schema_version must be 1");
+  const accounting = record.accounting;
+  if (!accounting || typeof accounting !== "object" || Array.isArray(accounting)) {
+    throw new Error("accounting must be a JSON object");
+  }
+  const accountingRecord = accounting as Record<string, unknown>;
+  const unexpectedAccounting = Object.keys(accountingRecord).filter((key) => key !== "query_commands");
+  if (unexpectedAccounting.length > 0) {
+    throw new Error(`unexpected accounting field: ${unexpectedAccounting[0]}`);
+  }
+  const commands = accountingRecord.query_commands;
+  if (!Array.isArray(commands) || commands.length === 0) {
+    throw new Error("accounting.query_commands must be a non-empty array");
+  }
+  return commands.map((command, commandIndex) => {
+    if (!Array.isArray(command) || command.length === 0) {
+      throw new Error(`accounting.query_commands[${commandIndex}] must be a non-empty argv array`);
+    }
+    return command.map((argument, argumentIndex) => {
+      if (typeof argument !== "string" || argument.length === 0 || argument.includes("\0")) {
+        throw new Error(
+          `accounting.query_commands[${commandIndex}][${argumentIndex}] must be a non-empty string without NUL`,
+        );
+      }
+      return argument;
+    });
+  });
+}
+
+export function loadAccountingQueryCommands(): AccountingQueryCommand[] {
+  const configBase = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config");
+  const configPath = join(configBase, "paseo-slurm", "config.json");
+  if (!existsSync(configPath)) {
+    return DEFAULT_ACCOUNTING_QUERY_COMMANDS.map((command) => [...command]);
+  }
+  try {
+    return parsePaseoSlurmConfig(JSON.parse(readFileSync(configPath, "utf8")));
+  } catch (error) {
+    throw new Error(
+      `cannot read ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 function stateRoot(): string {
@@ -294,6 +353,7 @@ function createGroupRecordLocked(options: {
   mode: WaitGroupMode;
   intervalSeconds: number;
   sentinelPollSeconds: number;
+  accountingQueryCommands: AccountingQueryCommand[];
   paseoBin: string;
 }): WaitGroup {
   const now = new Date().toISOString();
@@ -303,6 +363,7 @@ function createGroupRecordLocked(options: {
     mode: options.mode,
     intervalSeconds: options.intervalSeconds,
     sentinelPollSeconds: options.sentinelPollSeconds,
+    accountingQueryCommands: options.accountingQueryCommands,
     paseoBin: options.paseoBin,
     createdAt: now,
     updatedAt: now,
@@ -499,24 +560,82 @@ export function buildGroupResumePrompt(
   ].join("\n");
 }
 
-function querySacct(jobId: string, array = false): SlurmResult | undefined {
-  if (array) {
-    const active = spawnSync("squeue", ["-h", "-j", jobId, "-o", "%i"], {
+function commandLabel(command: AccountingQueryCommand): string {
+  return command.map((argument) => JSON.stringify(argument)).join(" ");
+}
+
+export interface AccountingQueryJob {
+  jobId: string;
+  array?: boolean;
+}
+
+export function querySacctMany(
+  jobs: AccountingQueryJob[],
+  queryCommands: AccountingQueryCommand[] = DEFAULT_ACCOUNTING_QUERY_COMMANDS,
+): Map<string, SlurmResult | undefined> {
+  if (jobs.length === 0) return new Map();
+  const seen = new Set<string>();
+  for (const job of jobs) {
+    validateJobId(job.jobId);
+    if (seen.has(job.jobId)) throw new Error(`duplicate accounting query job ID: ${job.jobId}`);
+    seen.add(job.jobId);
+  }
+
+  const activeArrays = new Set<string>();
+  const arrayJobs = jobs.filter((job) => job.array);
+  if (arrayJobs.length > 0) {
+    const active = spawnSync(
+      "squeue",
+      ["-h", "-j", arrayJobs.map((job) => job.jobId).join(","), "-o", "%i"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    if (!active.error && active.status === 0) {
+      for (const line of active.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+        for (const job of arrayJobs) {
+          if (line === job.jobId || line.startsWith(`${job.jobId}_`)) activeArrays.add(job.jobId);
+        }
+      }
+    }
+  }
+
+  const sacctArguments = [
+    "-X", "-n", "-P", "-j", jobs.map((job) => job.jobId).join(","),
+    "--format=JobID,JobIDRaw,State,ExitCode,Elapsed",
+  ];
+  const failures: string[] = [];
+  for (let index = 0; index < queryCommands.length; index += 1) {
+    const command = queryCommands[index];
+    if (!command || command.length === 0) throw new Error("accounting query command cannot be empty");
+    const result = spawnSync(command[0], [...command.slice(1), ...sacctArguments], {
       encoding: "utf8",
       timeout: 10_000,
     });
-    if (!active.error && active.status === 0 && active.stdout.trim()) return undefined;
+    if (result.error) {
+      failures.push(`${commandLabel(command)}: ${result.error.message}`);
+      continue;
+    }
+    if (result.status !== 0) {
+      failures.push(
+        `${commandLabel(command)} exited ${result.status}: ${result.stderr.trim() || "no stderr"}`,
+      );
+      continue;
+    }
+    const results = new Map<string, SlurmResult | undefined>();
+    for (const job of jobs) {
+      const parsed = activeArrays.has(job.jobId) ? undefined : parseSacct(result.stdout, job.jobId);
+      results.set(job.jobId, parsed && index > 0 ? { ...parsed, source: "sacct-fallback" } : parsed);
+    }
+    return results;
   }
-  const result = spawnSync(
-    "sacct",
-    ["-X", "-n", "-P", "-j", jobId, "--format=JobID,JobIDRaw,State,ExitCode,Elapsed"],
-    { encoding: "utf8", timeout: 10_000 },
-  );
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`sacct exited ${result.status}: ${result.stderr.trim()}`);
-  }
-  return parseSacct(result.stdout, jobId);
+  throw new Error(`all accounting query commands failed: ${failures.join("; ")}`);
+}
+
+export function querySacct(
+  jobId: string,
+  array = false,
+  queryCommands: AccountingQueryCommand[] = DEFAULT_ACCOUNTING_QUERY_COMMANDS,
+): SlurmResult | undefined {
+  return querySacctMany([{ jobId, array }], queryCommands).get(jobId);
 }
 
 function querySentinel(path: string | undefined): SlurmResult | undefined {
@@ -954,8 +1073,12 @@ async function watchRegistration(id: string, controllerGeneration: string): Prom
       try {
         let result = querySentinel(registration.sentinelPath);
         if (!result && Date.now() >= nextSacctAt) {
-          result = querySacct(registration.jobId, registration.array);
           nextSacctAt = Date.now() + registration.intervalSeconds * 1000;
+          result = querySacct(
+            registration.jobId,
+            registration.array,
+            registration.accountingQueryCommands,
+          );
         }
         if (result) {
           const accepted = await withExternalWaitTransition(registration.agentId, () => {
@@ -1134,20 +1257,53 @@ async function watchGroup(id: string, controllerGeneration: string): Promise<voi
       sentinelWatcher.update(pendingItems.map((item) => item.sentinelPath));
       const observedGeneration = sentinelWatcher.snapshot();
 
+      const detectedResults = new Map<string, SlurmResult>();
+      const dueItems: WaitGroupItem[] = [];
+      const now = Date.now();
       for (const item of pendingItems) {
+        let sentinelResult: SlurmResult | undefined;
         try {
-          let result = querySentinel(item.sentinelPath);
-          const backupIntervalSeconds = item.sentinelPath
-            ? group.intervalSeconds
-            : Math.min(group.intervalSeconds, 5);
-          const dueAt =
-            nextSacctAt.get(item.jobId) ?? Date.now() + backupIntervalSeconds * 1000;
-          nextSacctAt.set(item.jobId, dueAt);
-          if (!result && Date.now() >= dueAt) {
-            result = querySacct(item.jobId, item.array);
-            nextSacctAt.set(item.jobId, Date.now() + backupIntervalSeconds * 1000);
+          sentinelResult = querySentinel(item.sentinelPath);
+        } catch (error) {
+          appendLog(
+            id,
+            `sentinel check failed job=${item.jobId}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        if (sentinelResult) {
+          detectedResults.set(item.jobId, sentinelResult);
+          continue;
+        }
+        const backupIntervalSeconds = item.sentinelPath
+          ? group.intervalSeconds
+          : Math.min(group.intervalSeconds, 5);
+        const dueAt = nextSacctAt.get(item.jobId) ?? now + backupIntervalSeconds * 1000;
+        nextSacctAt.set(item.jobId, dueAt);
+        if (now >= dueAt) {
+          nextSacctAt.set(item.jobId, now + backupIntervalSeconds * 1000);
+          dueItems.push(item);
+        }
+      }
+
+      if (dueItems.length > 0) {
+        try {
+          const accountingResults = querySacctMany(dueItems, group.accountingQueryCommands);
+          for (const item of dueItems) {
+            const result = accountingResults.get(item.jobId);
+            if (result) detectedResults.set(item.jobId, result);
           }
-          if (!result) continue;
+        } catch (error) {
+          appendLog(
+            id,
+            `status check failed jobs=${dueItems.map((item) => item.jobId).join(",")}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+
+      for (const item of pendingItems) {
+        const result = detectedResults.get(item.jobId);
+        if (!result) continue;
+        try {
           const accepted = await withExternalWaitTransition(group.agentId, () => {
             group = readGroup(id);
             assertGroupController(group, controllerGeneration);
@@ -1168,7 +1324,7 @@ async function watchGroup(id: string, controllerGeneration: string): Promise<voi
         } catch (error) {
           appendLog(
             id,
-            `status check failed job=${item.jobId}: ${error instanceof Error ? error.message : String(error)}`,
+            `terminal persistence failed job=${item.jobId}: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
       }
@@ -1296,15 +1452,13 @@ async function submit(argv: string[]): Promise<void> {
         mode: (requestedMode || "each") as WaitGroupMode,
         intervalSeconds,
         sentinelPollSeconds,
+        accountingQueryCommands: loadAccountingQueryCommands(),
         paseoBin,
       });
     } else {
       group = adoptGroupClaim(group);
       if (requestedMode && requestedMode !== group.mode) {
         throw new Error(`active group ${group.id} uses mode=${group.mode}, not ${requestedMode}`);
-      }
-      if (group.mode === "all" && group.status === "watching") {
-        throw new Error("cannot submit jobs to an all-mode group after watching starts");
       }
       if (["callback_ambiguous", "finalizing", "cancelling", "completed", "cancelled", "abandoned"].includes(group.status)) {
         throw new Error(`cannot submit jobs to ${group.status} group ${group.id}`);
@@ -1397,6 +1551,13 @@ async function submit(argv: string[]): Promise<void> {
       group.pendingSubmissions = group.pendingSubmissions?.filter(
         (submission) => submission.token !== submissionToken,
       );
+      const labelError = updateExternalWaitLabelOwned(group, groupRef(group), group.id);
+      if (labelError) {
+        group.error = `submitted job ${jobId} but failed to activate external wait: ${labelError}`;
+        writeGroup(group);
+        throw new Error(`${group.error}; run paseo-slurm recover`);
+      }
+      group = ensureGroupControllerLocked(group);
       writeGroup(group);
     } catch (error) {
       console.error(
@@ -1405,7 +1566,7 @@ async function submit(argv: string[]): Promise<void> {
       throw error;
     }
     console.log(
-      `SUBMITTED_SLURM group_id=${group.id} mode=${group.mode} job_id=${jobId} array=${arrayJob} sentinel=${sentinelPath ?? "none"} submission=${submissionToken}`,
+      `WAITING_SLURM_GROUP group_id=${group.id} mode=${group.mode} jobs=${group.items.map((item) => item.jobId).join(",")} submitted_job=${jobId} watcher_pid=${group.watcherPid}`,
     );
   });
 }
@@ -1438,6 +1599,7 @@ async function register(args: ParsedArgs): Promise<void> {
     array: arrayJob || undefined,
     intervalSeconds,
     sentinelPollSeconds,
+    accountingQueryCommands: loadAccountingQueryCommands(),
     resumePrompt: stringOption(args, "resume-prompt"),
     paseoBin: stringOption(args, "paseo-bin") || "paseo",
     createdAt: now,
@@ -1492,6 +1654,7 @@ async function createGroup(args: ParsedArgs): Promise<void> {
       mode: rawMode,
       intervalSeconds,
       sentinelPollSeconds,
+      accountingQueryCommands: loadAccountingQueryCommands(),
       paseoBin: stringOption(args, "paseo-bin") || "paseo",
     });
   });
@@ -1513,9 +1676,6 @@ async function addGroupJob(args: ParsedArgs): Promise<void> {
       throw new Error(`cannot add a job to ${group.status} group ${id}`);
     }
     group = adoptGroupClaim(group);
-    if (group.mode === "all" && group.status === "watching") {
-      throw new Error("cannot add jobs to an all-mode group after watching starts");
-    }
     if (group.items.some((item) => item.jobId === jobId)) {
       throw new Error(`job ${jobId} is already in group ${id}`);
     }
@@ -1955,7 +2115,8 @@ function usage(): void {
   console.log(`Usage:
   paseo-slurm submit [--mode each|all] [--resume-prompt TEXT]
                      [--sentinel auto|off] [--sentinel-poll SECONDS]
-                     [--sacct-interval SECONDS] -- SCRIPT [ARGS...]
+                     [--sacct-interval SECONDS]
+                     -- SCRIPT [ARGS...]
   paseo-slurm wait [--agent-id ID]
   paseo-slurm register --job-id ID [--sentinel PATH] [--interval SECONDS]
                        [--resume-prompt TEXT] [--agent-id ID] [--paseo-bin PATH]
