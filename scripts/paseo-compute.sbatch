@@ -2,7 +2,7 @@
 #SBATCH --job-name=paseo-daemon
 #SBATCH --partition=batch
 #SBATCH --exclude=compute-0-[0-35]
-#SBATCH --nodelist=compute-0-41
+#SBATCH --nodelist=compute-0-44
 #SBATCH --nodes=1
 #SBATCH --exclusive
 #SBATCH --ntasks=8
