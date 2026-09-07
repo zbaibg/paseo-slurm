@@ -507,28 +507,9 @@ async function runTask(id: string, controllerGeneration: string): Promise<void> 
       detached: true,
       stdio: ["ignore", output, errorOutput],
     });
-    closeSync(output);
-    closeSync(errorOutput);
-    output = undefined;
-    errorOutput = undefined;
-    if (child.pid) {
-      const childStart = processStartIdentity(child.pid);
-      if (!childStart) {
-        throw new Error(`cannot determine process-start identity for local payload pid ${child.pid}`);
-      }
-      task = await withExternalWaitTransition(task.agentId, () => {
-        const current = readTask(id);
-        assertTaskController(current, controllerGeneration);
-        current.processPid = child.pid;
-        current.processStart = childStart;
-        current.status = current.cancelRequestedAt ? "cancel_requested" : "watching";
-        writeTask(current);
-        return current;
-      });
-      appendLog(id, `watching pid=${child.pid}`);
-      if (task.cancelRequestedAt) signalProcessGroup(child.pid, childStart, "SIGTERM");
-    }
-    const outcome = await new Promise<{
+    // Subscribe before yielding to the transition lock: fast children may close
+    // while we persist their identity, and Node does not replay that event.
+    const childOutcome = new Promise<{
       code: number | null;
       signal: NodeJS.Signals | null;
       error?: string;
@@ -546,6 +527,27 @@ async function runTask(id: string, controllerGeneration: string): Promise<void> 
       child.once("error", (error) => finish({ code: null, signal: null, error: error.message }));
       child.once("close", (code, closeSignal) => finish({ code, signal: closeSignal }));
     });
+    closeSync(output);
+    closeSync(errorOutput);
+    output = undefined;
+    errorOutput = undefined;
+    if (child.pid) {
+      const childStart = processStartIdentity(child.pid);
+      // An already reaped fast child has no /proc identity. Its observed outcome
+      // still owns completion; never invent an identity for cancellation.
+      if (childStart) task = await withExternalWaitTransition(task.agentId, () => {
+        const current = readTask(id);
+        assertTaskController(current, controllerGeneration);
+        current.processPid = child.pid;
+        current.processStart = childStart;
+        current.status = current.cancelRequestedAt ? "cancel_requested" : "watching";
+        writeTask(current);
+        return current;
+      });
+      appendLog(id, `watching pid=${child.pid}`);
+      if (task.cancelRequestedAt && childStart) signalProcessGroup(child.pid, childStart, "SIGTERM");
+    }
+    const outcome = await childOutcome;
     exitCode = outcome.code;
     signal = outcome.signal;
     launchError = outcome.error;

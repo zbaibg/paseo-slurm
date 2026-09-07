@@ -127,6 +127,13 @@ paseo-local abandon --wait-id ID --generation TOKEN [--agent-id ID]
 tasks that already have a terminal result; it does not guess the outcome of an
 orphaned process.
 
+Fast local commands, including missing-script and executable-launch failures,
+are observed immediately after spawn, before asynchronous state transitions.
+They produce the same terminal record/callback as long commands; a child exiting
+while its identity is persisted must not leave a dead `watching` record. A missing
+script is still a command error (e.g. bash exit 127), not a successful job. This
+fix does not automatically rerun failed commands or release a genuinely live wait.
+
 One agent may own only one external wait at a time across `paseo-local`, a
 singleton Slurm registration, and a Slurm group (including `submit` in either
 mode). Creation first takes a per-agent kernel transition lock and publishes an

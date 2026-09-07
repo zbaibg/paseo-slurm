@@ -1,0 +1,7 @@
+# Repair record
+
+Observed local task5ac80f9b-local-1788820428600-35a4c5f6: bash reported nonexistent script; controller and payload absent, task persisted watching/no result. Its abandoned recovery was recorded separately before this repair. Actual S5 scientific retry remains untouched.
+
+Source review identified await withExternalWaitTransition between spawn and error/close listener installation. Fast child exits while flock helper starts; Node close is not replayed. Move outcome observation before any async transition. A fast reaped child may lack /proc start identity; use observed outcome without publishing unsafe PID identity. Shared Slurm transition holder listeners already precede await; no equivalent change required there. Preserve unrelated modified patches/paseo/README.md and untracked codex-astra-fast-mode.patch.
+
+Validation: isolated pinned-old-code reproduction fails with missing-script callback timeout; fixed fast exit0/exit1/bash127/ENOENT scenarios all finish and send exactly one callback. Full54testsPASS in10.82s, no live scheduler or daemon calls (fake Paseo). Build updates existing installed CLI symlink target; no daemon restart or active task manipulation. Result evidence/RESULT.md, regression script pins baseline26df381e. Existing unrelated patches left untouched. This is a bounded direct-compute transport repair, not a scientific calculation; no change to physical test results or acceptance.

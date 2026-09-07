@@ -162,6 +162,95 @@ process.stdout.write("{}\\n");
   }
 });
 
+for (const scenario of [
+  { name: "immediate success", command: ["/bin/true"], state: "COMPLETED", code: 0 },
+  { name: "immediate failure", command: ["/bin/false"], state: "FAILED", code: 1 },
+  { name: "missing script", command: ["/bin/bash", "/nonexistent/paseo-test-script"], state: "FAILED", code: 127 },
+  { name: "missing executable", command: ["/nonexistent/paseo-test-executable"], state: "FAILED", code: null },
+]) test(`paseo-local delivers one terminal callback for ${scenario.name}`, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-local-test-"));
+  try {
+    const stateHome = join(directory, "state");
+    const eventsPath = join(directory, "paseo-events.jsonl");
+    const fakePaseo = join(directory, "fake-paseo.cjs");
+    const stdoutPath = join(directory, "task.stdout");
+    const stderrPath = join(directory, "task.stderr");
+    writeFileSync(
+      fakePaseo,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args[0] === "inspect") {
+  process.stdout.write(JSON.stringify({ Status: "idle", Archived: false, PendingPermissions: [] }));
+  process.exit(0);
+}
+fs.appendFileSync(process.env.FAKE_PASEO_EVENTS, JSON.stringify(args) + "\\n");
+process.stdout.write("{}\\n");
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(fakePaseo, 0o700);
+    const cliPath = join(process.cwd(), "dist", "src", "local-cli.js");
+    const launched = spawnSync(
+      process.execPath,
+      [
+        cliPath,
+        "run",
+        "--agent-id",
+        "agent-test",
+        "--paseo-bin",
+        fakePaseo,
+        "--cwd",
+        directory,
+        "--stdout",
+        stdoutPath,
+        "--stderr",
+        stderrPath,
+        "--resume-prompt",
+        "Read the final test result once.",
+        "--",
+        ...scenario.command,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          XDG_STATE_HOME: stateHome,
+          FAKE_PASEO_EVENTS: eventsPath,
+        },
+      },
+    );
+    assert.equal(launched.status, 0, launched.stderr);
+    assert.match(launched.stdout, /^WAITING_LOCAL_TASK /);
+    const taskId = launched.stdout.match(/task_id=([^ ]+)/)?.[1];
+    assert.ok(taskId);
+
+    const taskPath = join(stateHome, "paseo-local", "tasks", `${taskId}.json`);
+    await waitUntil(() => {
+      if (!existsSync(taskPath) || !existsSync(eventsPath)) return false;
+      const task = JSON.parse(readFileSync(taskPath, "utf8")) as { status: string };
+      return task.status === "resumed" && readFileSync(eventsPath, "utf8").includes('"send"');
+    });
+
+    const task = JSON.parse(readFileSync(taskPath, "utf8")) as {
+      status: string;
+      result: LocalTaskResult;
+    };
+    assert.equal(task.status, "resumed");
+    assert.equal(task.result.state, scenario.state);
+    assert.equal(task.result.exitCode, scenario.code);
+
+    const events = readFileSync(eventsPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(events.filter((args) => args[0] === "send").length, 1);
+    assert.ok(events.some((args) => args.includes("--system") && args.includes("--no-wait")));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("paseo-local cancellation terminates the process group and reports CANCELLED", async () => {
   const directory = mkdtempSync(join(tmpdir(), "paseo-local-cancel-"));
   try {
