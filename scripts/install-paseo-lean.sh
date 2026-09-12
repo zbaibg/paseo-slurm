@@ -7,7 +7,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMBINED="${ROOT}/patches/paseo/external-wait-finish-deferral.patch"
 SYSTEM_SEND="${ROOT}/patches/paseo/system-send.patch"
-CODEX_RELOAD="${ROOT}/patches/paseo/codex-reload-close-before-resume.patch"
 CODEX_REWIND="${ROOT}/patches/paseo/codex-rewind-runtime-mcp.patch"
 APPLY_EXTERNAL="${ROOT}/scripts/apply-paseo-external-wait.sh"
 UPSTREAM_URL="${PASEO_UPSTREAM_URL:-https://github.com/getpaseo/paseo.git}"
@@ -34,8 +33,9 @@ Environment:
 Applies:
   external-wait-finish-deferral.patch (via apply-paseo-external-wait.sh)
   system-send.patch (only if the tree already has deferral but not --system)
-  codex-reload-close-before-resume.patch (close old Codex app-server before thread/resume)
   codex-rewind-runtime-mcp.patch (pass runtime MCP config on Codex rewind thread/fork)
+
+Does not apply retired v0.8.0-upstreamed companions (reload #4353, Astra Fast #4640).
 
 Does not start or restart the daemon. After install, submit
 scripts/paseo-compute.sbatch; never start Paseo on the login node.
@@ -57,7 +57,7 @@ if [[ -z "${REF}" ]]; then
   REF="${PASEO_LEAN_REF:-}"
 fi
 
-if [[ ! -f "${COMBINED}" || ! -f "${SYSTEM_SEND}" || ! -f "${CODEX_RELOAD}" || ! -f "${CODEX_REWIND}" || ! -x "${APPLY_EXTERNAL}" ]]; then
+if [[ ! -f "${COMBINED}" || ! -f "${SYSTEM_SEND}" || ! -f "${CODEX_REWIND}" || ! -x "${APPLY_EXTERNAL}" ]]; then
   echo "error: missing patch files or apply script under ${ROOT}" >&2
   exit 1
 fi
@@ -121,13 +121,6 @@ check_patches() {
     git -C "${SRC}" apply --check "${SYSTEM_SEND}" 2>&1 || true
     exit 1
   fi
-  if git -C "${SRC}" apply --check "${CODEX_RELOAD}"; then
-    echo "OK  ${CODEX_RELOAD}"
-  else
-    echo "error: Codex reload patch does not apply" >&2
-    git -C "${SRC}" apply --check "${CODEX_RELOAD}" 2>&1 || true
-    exit 1
-  fi
   if git -C "${SRC}" apply --check "${CODEX_REWIND}"; then
     echo "OK  ${CODEX_REWIND}"
   else
@@ -180,24 +173,17 @@ root = os.path.expanduser("~/.nvm/versions/node")
 if not os.path.isdir(root):
     print("warning: ~/.nvm not found; skip dist marker check", file=sys.stderr)
     raise SystemExit(0)
-hits = {"deferral": False, "codex_reload": False, "codex_rewind_mcp": False}
+hits = {"deferral": False, "codex_rewind_mcp": False}
 for dirpath, dirnames, filenames in os.walk(root):
     if "/@getpaseo/server/" not in dirpath.replace("\\", "/"):
         continue
     if "agent-prompt.js" in filenames:
         text = open(os.path.join(dirpath, "agent-prompt.js"), encoding="utf-8").read()
         hits["deferral"] = "getExternalWaitIdFromLabels" in text
-    if "agent-manager.js" in filenames:
-        text = open(os.path.join(dirpath, "agent-manager.js"), encoding="utf-8").read()
-        hits["codex_reload"] = (
-            "Closing previous session before reload resume" in text
-            and "finalizeFailedReload" in text
-            and "providerSessionClosed" in text
-        )
     if "rewind.js" in filenames and dirpath.replace("\\", "/").endswith("/providers/codex"):
         text = open(os.path.join(dirpath, "rewind.js"), encoding="utf-8").read()
         hits["codex_rewind_mcp"] = "issue #3205" in text
-if not hits["deferral"] or not hits["codex_reload"] or not hits["codex_rewind_mcp"]:
+if not hits["deferral"] or not hits["codex_rewind_mcp"]:
     print("error: global @getpaseo/server dist is missing patch markers", hits, file=sys.stderr)
     raise SystemExit(1)
 print("OK  dist markers", hits)
@@ -216,13 +202,6 @@ fi
 
 echo "=== apply patches ==="
 "${APPLY_EXTERNAL}" "${SRC}"
-if grep -Fq "finalizeFailedReload" \
-  "${SRC}/packages/server/src/server/agent/agent-manager.ts"; then
-  echo "ALREADY_APPLIED ${CODEX_RELOAD}"
-else
-  git -C "${SRC}" apply "${CODEX_RELOAD}"
-  echo "APPLIED ${CODEX_RELOAD} -> ${SRC}"
-fi
 if grep -Fq "issue #3205" \
   "${SRC}/packages/server/src/server/agent/providers/codex/rewind.ts"; then
   echo "ALREADY_APPLIED ${CODEX_REWIND}"

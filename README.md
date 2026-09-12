@@ -338,8 +338,7 @@ equivalent that also ships `paseo send --system`) lands, this repo vendors:
 - `scripts/paseo-compute.sbatch` (compute-node daemon; do not start Paseo locally)
 - `scripts/tmpdir_paseo_restart.sh` (refuses local restart; prints the sbatch command)
 - notes: `patches/paseo/README.md` and `patches/paseo/install-and-patch.md`
-- `patches/paseo/codex-reload-close-before-resume.patch` (close old app-server before `thread/resume`; failed reload stays visible in `error`)
-- `patches/paseo/codex-rewind-runtime-mcp.patch` (pass runtime MCP on `thread/fork`)
+- `patches/paseo/codex-rewind-runtime-mcp.patch` (pass runtime MCP on `thread/fork`, including v0.8.0 paginated rewind)
 
 Do **not** `npm install` the full Paseo monorepo on scratch (React Native /
 website workspaces are ~150k inodes). Install like this:

@@ -1,23 +1,24 @@
-From local/paseo-v0.7.0-companion Mon Sep 17 00:00:00 2001
+From local/paseo-v0.8.0-companion Mon Sep 17 00:00:00 2001
 From: zbai29 <zbai29@wisc.edu>
-Date: Mon, 31 Aug 2026 22:54:16 +0000
+Date: Fri, 11 Sep 2026 00:00:00 +0000
 Subject: [PATCH] Pass runtime Codex config through rewind thread/fork
 
 Codex rewind used thread/fork without the runtime-injected mcp_servers
 overlay. The forked thread stays loaded, so thread/resume never restores
-Paseo's daemon MCP endpoint (getpaseo/paseo#3205).
+Paseo's daemon MCP endpoint (getpaseo/paseo#3205). Both legacy rollback
+forks and paginated beforeTurnId forks now receive the overlay.
 
-Independent of the external-wait and reload patches.
+Independent of the external-wait patches.
 
-Rebased onto getpaseo/paseo v0.7.0 (c56638ea8).
+Rebased onto getpaseo/paseo v0.8.0 (e432c9b47).
 
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
 diff --git a/packages/server/src/server/agent/providers/codex-app-server-agent.test.ts b/packages/server/src/server/agent/providers/codex-app-server-agent.test.ts
-index 664af04f3..f57e080cf 100644
+index 15e7cfdf5..988b58219 100644
 --- a/packages/server/src/server/agent/providers/codex-app-server-agent.test.ts
 +++ b/packages/server/src/server/agent/providers/codex-app-server-agent.test.ts
-@@ -1669,6 +1669,50 @@ describe("Codex app-server provider", () => {
+@@ -1680,6 +1680,50 @@ describe("Codex app-server provider", () => {
      await session.close();
    });
  
@@ -65,14 +66,14 @@ index 664af04f3..f57e080cf 100644
 +    await session.close();
 +  });
 +
-   test("correlates a Codex user message with the submitting client message", async () => {
-     const appServer = createFakeCodexAppServer();
-     const session = new CodexAppServerAgentSession(
+   test("rewinds a paginated conversation through the public session capability", async () => {
+     const appServer = createFakeCodexAppServer({
+       "thread/read": () => ({
 diff --git a/packages/server/src/server/agent/providers/codex-app-server-agent.ts b/packages/server/src/server/agent/providers/codex-app-server-agent.ts
-index b38bc6910..257dc931d 100644
+index 7123db17c..ad8267084 100644
 --- a/packages/server/src/server/agent/providers/codex-app-server-agent.ts
 +++ b/packages/server/src/server/agent/providers/codex-app-server-agent.ts
-@@ -4648,6 +4648,10 @@ export class CodexAppServerAgentSession implements AgentSession {
+@@ -4757,6 +4757,10 @@ export class CodexAppServerAgentSession implements AgentSession {
        await this.ensureThread();
      }
  
@@ -83,7 +84,7 @@ index b38bc6910..257dc931d 100644
      await revertCodexConversation({
        client: this.client,
        threadId: this.currentThreadId,
-@@ -4655,6 +4659,8 @@ export class CodexAppServerAgentSession implements AgentSession {
+@@ -4764,6 +4768,8 @@ export class CodexAppServerAgentSession implements AgentSession {
        cwd: this.config.cwd ?? null,
        model: this.config.model ?? null,
        serviceTier: this.serviceTier,
@@ -93,10 +94,10 @@ index b38bc6910..257dc931d 100644
        setThreadId: async (threadId) => {
          this.currentThreadId = threadId;
 diff --git a/packages/server/src/server/agent/providers/codex/rewind.test.ts b/packages/server/src/server/agent/providers/codex/rewind.test.ts
-index c9c751c50..e490884af 100644
+index 923b8074b..f15f5d75d 100644
 --- a/packages/server/src/server/agent/providers/codex/rewind.test.ts
 +++ b/packages/server/src/server/agent/providers/codex/rewind.test.ts
-@@ -147,4 +147,43 @@ describe("Codex Rewind", () => {
+@@ -245,4 +245,95 @@ describe("Codex Rewind", () => {
      expect(codex.recordedForks).toEqual([]);
      expect(codex.recordedRollbacks).toEqual([]);
    });
@@ -139,12 +140,64 @@ index c9c751c50..e490884af 100644
 +      },
 +    ]);
 +  });
++
++  test("forwards runtime Codex config onto a paginated thread/fork", async () => {
++    class PaginatedCodex extends FakeCodex {
++      override request(method: string): Promise<unknown> {
++        if (method === "thread/read") {
++          return Promise.resolve({ thread: { id: "source-thread", historyMode: "paginated" } });
++        }
++        throw new Error(`Unexpected request: ${method}`);
++      }
++    }
++
++    const codex = new PaginatedCodex();
++    const userMessageTurns = new CodexMessageTurns(
++      new Map([["codex-first", 0]]),
++      new Map([["codex-first", "turn-first"]]),
++    );
++    const runtimeConfig = {
++      mcp_servers: {
++        paseo: {
++          url: "http://127.0.0.1:6767/mcp/agents",
++        },
++      },
++    };
++
++    await revertCodexConversation({
++      client: codex,
++      threadId: "source-thread",
++      messageId: "codex-first",
++      cwd: "/workspace/project",
++      model: "gpt-5.4-mini",
++      serviceTier: null,
++      config: runtimeConfig,
++      developerInstructions: "runtime instructions",
++      userMessageTurns,
++      setThreadId: () => undefined,
++    });
++
++    expect(codex.recordedForks).toEqual([
++      {
++        threadId: "source-thread",
++        beforeTurnId: "turn-first",
++        cwd: "/workspace/project",
++        model: "gpt-5.4-mini",
++        serviceTier: null,
++        excludeTurns: false,
++        persistExtendedHistory: true,
++        config: runtimeConfig,
++        developerInstructions: "runtime instructions",
++      },
++    ]);
++    expect(codex.recordedRollbacks).toEqual([]);
++  });
  });
 diff --git a/packages/server/src/server/agent/providers/codex/rewind.ts b/packages/server/src/server/agent/providers/codex/rewind.ts
-index 9f7bb3bcc..bacf6421e 100644
+index f3573c58a..2569a02b1 100644
 --- a/packages/server/src/server/agent/providers/codex/rewind.ts
 +++ b/packages/server/src/server/agent/providers/codex/rewind.ts
-@@ -47,6 +47,8 @@ export async function revertCodexConversation(input: {
+@@ -67,6 +67,8 @@ export async function revertCodexConversation(input: {
    cwd?: string | null;
    model?: string | null;
    serviceTier?: string | null;
@@ -153,23 +206,34 @@ index 9f7bb3bcc..bacf6421e 100644
    userMessageTurns: CodexUserMessageTurnIndex;
    setThreadId: (threadId: string) => void | Promise<void>;
  }): Promise<void> {
-@@ -67,6 +69,8 @@ export async function revertCodexConversation(input: {
+@@ -86,6 +88,14 @@ export async function revertCodexConversation(input: {
+   }
  
-   // Fork is non-destructive: the old thread file stays on disk and remains
-   // recoverable with `codex resume <old-uuid>` if the rewind target was wrong.
+   const historyMode = await readCodexThreadHistoryMode(input.client, input.threadId);
 +  // Pass runtime-injected Codex config here: the forked thread stays loaded, so
 +  // the later thread/resume path never re-applies mcp_servers (issue #3205).
-   const forked = await forkCodexThread(input.client, {
-     threadId: input.threadId,
-     cwd: input.cwd ?? null,
-@@ -74,6 +78,10 @@ export async function revertCodexConversation(input: {
-     serviceTier: input.serviceTier ?? null,
-     excludeTurns: false,
-     persistExtendedHistory: true,
++  const runtimeForkOverlay = {
 +    ...(input.config ? { config: input.config } : {}),
 +    ...(input.developerInstructions
 +      ? { developerInstructions: input.developerInstructions }
 +      : {}),
++  };
+   if (historyMode === "paginated") {
+     if (!targetTurn.turnId) {
+       throw new Error(`Codex could not find the turn containing user message ${input.messageId}`);
+@@ -98,6 +108,7 @@ export async function revertCodexConversation(input: {
+       serviceTier: input.serviceTier ?? null,
+       excludeTurns: false,
+       persistExtendedHistory: true,
++      ...runtimeForkOverlay,
+     });
+     await input.setThreadId(forked.thread.id);
+     return;
+@@ -112,6 +123,7 @@ export async function revertCodexConversation(input: {
+     serviceTier: input.serviceTier ?? null,
+     excludeTurns: false,
+     persistExtendedHistory: true,
++    ...runtimeForkOverlay,
    });
    const forkedThreadId = forked.thread.id;
  

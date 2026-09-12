@@ -1,0 +1,18 @@
+Subject: [PATCH] Allow Codex Fast mode for GPT-6 Astra
+
+Add Astra to the Fast capability allowlist used by feature discovery and
+backend validation. Upstream issue: https://github.com/getpaseo/paseo/issues/4451
+
+The same allowlist is present in v0.7.2 and main at
+1f5b6143d603ebecc678daf76d407938175be044.
+
+diff --git a/packages/server/src/server/agent/providers/codex-feature-definitions.ts b/packages/server/src/server/agent/providers/codex-feature-definitions.ts
+--- a/packages/server/src/server/agent/providers/codex-feature-definitions.ts
++++ b/packages/server/src/server/agent/providers/codex-feature-definitions.ts
+@@ -1,5 +1,5 @@
+ import type { AgentFeature, AgentFeatureToggle } from "../agent-sdk-types.js";
+ 
+-const CODEX_FAST_MODE_SUPPORTED_MODEL_PREFIXES = ["gpt-5", "gpt-4.1", "o3", "o4-mini"] as const;
++const CODEX_FAST_MODE_SUPPORTED_MODEL_PREFIXES = ["gpt-5", "gpt-4.1", "o3", "o4-mini", "gpt-6-astra"] as const;
+ 
+ export const CODEX_FAST_MODE_FEATURE: Omit<AgentFeatureToggle, "value"> = {

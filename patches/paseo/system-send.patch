@@ -1,18 +1,30 @@
-From local/paseo-v0.7.0-companion Mon Sep 17 00:00:00 2001
+From local/paseo-v0.8.0-companion Mon Sep 17 00:00:00 2001
 From: zbai29 <zbai29@wisc.edu>
-Date: Mon, 31 Aug 2026 22:54:16 +0000
+Date: Fri, 11 Sep 2026 00:00:00 +0000
 Subject: [PATCH] Add paseo send --system for external-wait resumes
 
 Incremental on top of the finish-deferral companion patch. Vanilla checkouts
 should apply external-wait-finish-deferral.patch instead (it already includes
 this).
 
-Rebased onto getpaseo/paseo v0.7.0 plus finish deferral.
-
-Rebased onto getpaseo/paseo v0.7.0 (c56638ea8).
+Rebased onto getpaseo/paseo v0.8.0 (e432c9b47) plus finish deferral.
 
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
+diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
+index b99a106fd..103388107 100644
+--- a/docs/agent-lifecycle.md
++++ b/docs/agent-lifecycle.md
+@@ -93,6 +93,9 @@ The label marks an external controller's ownership; Paseo does not interpret the
+ the external system, group membership, or completion strategy. The controller must serialize its
+ state transitions and completion prompts. Errors and permission requests still notify the caller
+ immediately. Clearing the label while the child is idle does not itself complete the delegated task.
++External controllers should resume the child with `paseo send --system`; this uses the same hidden
++system-context path as child-to-parent finish notifications instead of adding a user-message bubble
++to the timeline.
+ Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
+ The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
+ A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.
 diff --git a/packages/cli/src/commands/agent/send.ts b/packages/cli/src/commands/agent/send.ts
 index 06249289b..39949f062 100644
 --- a/packages/cli/src/commands/agent/send.ts
@@ -43,10 +55,10 @@ index 06249289b..39949f062 100644
      // If --no-wait, return immediately
      if (options.wait === false) {
 diff --git a/packages/client/src/daemon-client.ts b/packages/client/src/daemon-client.ts
-index 0a194da2f..9cf72f541 100644
+index e22534da3..06dd4d6c7 100644
 --- a/packages/client/src/daemon-client.ts
 +++ b/packages/client/src/daemon-client.ts
-@@ -342,6 +342,7 @@ export interface DaemonClientTrace {
+@@ -353,6 +353,7 @@ export interface DaemonClientTrace {
  
  export interface SendMessageOptions {
    messageId?: string;
@@ -54,7 +66,7 @@ index 0a194da2f..9cf72f541 100644
    activeTurnBehavior?: ActiveTurnBehavior;
    images?: Array<{ data: string; mimeType: string }>;
    attachments?: SendAgentMessageRequest["attachments"];
-@@ -3043,13 +3044,14 @@ export class DaemonClient {
+@@ -3192,13 +3193,14 @@ export class DaemonClient {
      options?: SendMessageOptions,
    ): Promise<void> {
      const requestId = this.createRequestId();
@@ -71,10 +83,10 @@ index 0a194da2f..9cf72f541 100644
        ...(options?.images ? { images: options.images } : {}),
        ...(options?.attachments ? { attachments: options.attachments } : {}),
 diff --git a/packages/client/src/index.test.ts b/packages/client/src/index.test.ts
-index 50de0f2f9..4ee81efd1 100644
+index 7cf75b580..bae088833 100644
 --- a/packages/client/src/index.test.ts
 +++ b/packages/client/src/index.test.ts
-@@ -631,6 +631,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
+@@ -723,6 +723,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
    );
    await sendPromise;
  
@@ -104,10 +116,10 @@ index 50de0f2f9..4ee81efd1 100644
      messageId: "run-message-sdk",
      timeoutMs: 30_000,
 diff --git a/packages/client/src/index.ts b/packages/client/src/index.ts
-index 268e200ab..8dfd69004 100644
+index 7068cdc0b..73c308a08 100644
 --- a/packages/client/src/index.ts
 +++ b/packages/client/src/index.ts
-@@ -228,6 +228,7 @@ export interface PaseoAgentTimelineRefetchOptions {
+@@ -256,6 +256,7 @@ export interface PaseoAgentTimelineRefetchOptions {
  
  export interface PaseoAgentSendOptions {
    messageId?: string;
@@ -116,7 +128,7 @@ index 268e200ab..8dfd69004 100644
    attachments?: SendAgentMessageRequest["attachments"];
  }
 diff --git a/packages/protocol/src/messages.test.ts b/packages/protocol/src/messages.test.ts
-index 015164f70..fc13ed9d1 100644
+index 3394c8e15..95c5368f7 100644
 --- a/packages/protocol/src/messages.test.ts
 +++ b/packages/protocol/src/messages.test.ts
 @@ -76,6 +76,22 @@ describe("project icon revision compatibility", () => {
@@ -143,10 +155,10 @@ index 015164f70..fc13ed9d1 100644
    test("old-shaped fetch_workspaces_response without project still parses", () => {
      const parsed = SessionOutboundMessageSchema.parse(
 diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
-index 35dd1e8ad..a0f901f36 100644
+index ed36eeb1a..664adb305 100644
 --- a/packages/protocol/src/messages.ts
 +++ b/packages/protocol/src/messages.ts
-@@ -1221,6 +1221,7 @@ export const SendAgentMessageSchema = z.object({
+@@ -1245,6 +1245,7 @@ export const SendAgentMessageSchema = z.object({
    agentId: z.string(),
    text: z.string(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
@@ -154,7 +166,7 @@ index 35dd1e8ad..a0f901f36 100644
    activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
-@@ -1374,6 +1375,7 @@ export const SendAgentMessageRequestSchema = z.object({
+@@ -1399,6 +1400,7 @@ export const SendAgentMessageRequestSchema = z.object({
    agentId: z.string(),
    text: z.string(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
@@ -163,10 +175,10 @@ index 35dd1e8ad..a0f901f36 100644
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
 diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
-index 21a134f54..214a46f4c 100644
+index c1e149ee5..c484112bb 100644
 --- a/packages/server/src/server/session.ts
 +++ b/packages/server/src/server/session.ts
-@@ -41,6 +41,8 @@ import {
+@@ -44,6 +44,8 @@ import {
  } from "./persistence-hooks.js";
  import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
  import {
@@ -175,7 +187,7 @@ index 21a134f54..214a46f4c 100644
    sendPromptToAgent,
    waitForAgentRunStartWithTimeout,
    unarchiveAgentState,
-@@ -7322,11 +7324,15 @@ export class Session {
+@@ -7587,11 +7589,15 @@ export class Session {
      try {
        const agentId = resolved.agentId;
  
@@ -193,7 +205,7 @@ index 21a134f54..214a46f4c 100644
            activeTurnBehavior: msg.activeTurnBehavior,
            textPrefix: msg.text.slice(0, 80),
          },
-@@ -7339,7 +7345,7 @@ export class Session {
+@@ -7603,7 +7609,7 @@ export class Session {
            agentStorage: this.agentStorage,
            agentId,
            prompt,
@@ -202,16 +214,3 @@ index 21a134f54..214a46f4c 100644
            activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
            clearPendingPermissions: true,
            logger: this.sessionLogger,
-diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
---- a/docs/agent-lifecycle.md
-+++ b/docs/agent-lifecycle.md
-@@ -80,6 +80,9 @@ The label marks an external controller's ownership; Paseo does not interpret the
- the external system, group membership, or completion strategy. The controller must serialize its
- state transitions and completion prompts. Errors and permission requests still notify the caller
- immediately. Clearing the label while the child is idle does not itself complete the delegated task.
-+External controllers should resume the child with `paseo send --system`; this uses the same hidden
-+system-context path as child-to-parent finish notifications instead of adding a user-message bubble
-+to the timeline.
- Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
- The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
- A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.

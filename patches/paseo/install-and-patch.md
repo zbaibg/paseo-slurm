@@ -32,7 +32,7 @@ From this repo (`paseo-slurm`):
 ```
 
 Default build tree: `/var/tmp/paseo-lean` (login-node disk, not CephFS).
-Override with `--src DIR` or `PASEO_LEAN_SRC`. Pin a tag with `--ref v0.4.0`
+Override with `--src DIR` or `PASEO_LEAN_SRC`. Pin a tag with `--ref v0.8.0`
 or `PASEO_LEAN_REF`.
 
 Then load the new server **only** by submitting the compute-node job. Do not
@@ -54,11 +54,10 @@ agents. Do not do it from an unattended worker.
 2. Clone or `git fetch --tags` `https://github.com/getpaseo/paseo.git`.
 3. `git reset --hard` that release tag so the tree is vanilla.
 4. `git apply --check` on `external-wait-finish-deferral.patch` (or the
-   incremental `system-send.patch` if deferral is already present), on
-   `codex-reload-close-before-resume.patch`, and on
+   incremental `system-send.patch` if deferral is already present) and on
    `codex-rewind-runtime-mcp.patch`.
 5. Apply those patches (`scripts/apply-paseo-external-wait.sh` is idempotent;
-   the Codex reload and rewind MCP patches are applied next).
+   the Codex rewind MCP patch is applied next).
 6. Rewrite root `workspaces` to only:
    `highlight`, `plugin`, `protocol`, `client`, `server`, `relay`, `cli`
    (drops `app`, `website`, `desktop`, `expo-two-way-audio`).
@@ -89,17 +88,18 @@ for an unpatched registry install).
 
 ```bash
 which paseo          # should be ~/.nvm/versions/node/.../bin/paseo
-paseo --version      # e.g. 0.4.0 (stable, not *-beta.*)
+paseo --version      # e.g. 0.8.0 (stable, not *-beta.*)
 paseo send --help    # must list --system
 ```
 
 Global `@getpaseo/server` dist must contain:
 
 - `getExternalWaitIdFromLabels` in `agent-prompt.js`
-- `Closing previous session before reload resume` in `agent-manager.js`
 - `issue #3205` in `providers/codex/rewind.js`
 
-The installer checks those markers.
+The installer checks those markers. Stock v0.8.0 already includes Codex
+close-before-resume reload (#4353) and Astra Fast (#4640); those are not
+companion-patch markers.
 
 ## After upstream merges
 
@@ -112,9 +112,10 @@ or delete the patch, not force-apply.
 ## Patch notes
 
 See [README.md](./README.md) in this directory for what each patch does.
-`codex-reload-close-before-resume.patch` is [#3574](https://github.com/getpaseo/paseo/pull/3574):
-close the previous Codex writer before `thread/resume`; if replacement setup
-fails, keep the agent in `error` rather than closing it.
 `codex-rewind-runtime-mcp.patch` is the #3205 rewind/`thread/fork` fix and is
-applied. Do not apply a resume-MCP rebind for #3283; Codex 0.148 already honors
+applied to both legacy rollback forks and v0.8.0 paginated `beforeTurnId`
+forks. Do not apply a resume-MCP rebind for #3283; Codex 0.148 already honors
 the overlay Paseo sends on `thread/resume` after daemon restart.
+
+Former reload (#3574) and Astra Fast (#4451) companions are retired under
+[superseded/](./superseded/).

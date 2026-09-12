@@ -7,12 +7,11 @@ lands the same behavior.
 | --- | --- |
 | Combined patch | `external-wait-finish-deferral.patch` (deferral + `paseo send --system`) |
 | Incremental patch | `system-send.patch` (only `--system`, for trees that already have deferral) |
-| Codex reload patch | `codex-reload-close-before-resume.patch` (close old app-server before `thread/resume`) |
 | Codex rewind MCP patch | `codex-rewind-runtime-mcp.patch` (pass runtime MCP config on `thread/fork`) |
 | Upstream discussion | https://github.com/getpaseo/paseo/discussions/3010 |
-| Upstream draft PR | https://github.com/getpaseo/paseo/pull/3011 |
+| Upstream draft PR | https://github.com/getpaseo/paseo/pull/3011 (closed unmerged) |
 | Upstream rewind bug | https://github.com/getpaseo/paseo/issues/3205 |
-| Verified against | `getpaseo/paseo` `v0.7.0` (`c56638ea8`) |
+| Verified against | `getpaseo/paseo` `v0.8.0` (`b8e24677e`) |
 | Install | [install-and-patch.md](./install-and-patch.md) — lean CLI/daemon from latest stable |
 
 Do not vendor a resume-MCP rebind for [getpaseo/paseo#3283](https://github.com/getpaseo/paseo/issues/3283): after daemon restart the thread is unloaded, so Paseo already sends the runtime overlay on `thread/resume`. Codex 0.148 honors that. That path is distinct from rewind/`thread/fork` (#3205).
@@ -39,21 +38,24 @@ sbatch ./scripts/paseo-compute.sbatch
 2. Add `paseo send --system`. Sidecar resumes use the same hidden
    `<paseo-system>` path as child-to-parent finish notifications, so they do
    not appear as a user-message bubble. Without this flag, `paseo-slurm`
-   resume attempts fail on stock stable CLI (`0.4.0`).
-3. Close the previous Codex app-server **before** spawning a replacement and
-   calling `thread/resume`. Reload used to start the new writer first, so a
-   live Codex agent failed reload with `already has an active writer`
-   ([#3574](https://github.com/getpaseo/paseo/pull/3574)). If resume/MCP setup
-   then fails, keep the agent visible in `error` and block `startTurn` until a
-   later reload succeeds. Independent of #3011.
-4. Pass the current runtime `buildCodexInnerConfig()` result (injected Paseo
+   resume attempts fail on stock stable CLI.
+3. Pass the current runtime `buildCodexInnerConfig()` result (injected Paseo
    MCP endpoint, developer instructions) on Codex `thread/fork` during
-   **Rewind conversation**. Without this, the forked thread stays loaded and
-   falls back to the Codex base MCP config
+   **Rewind conversation**, including the v0.8.0 paginated `beforeTurnId`
+   path. Without this, the forked thread stays loaded and falls back to the
+   Codex base MCP config
    ([getpaseo/paseo#3205](https://github.com/getpaseo/paseo/issues/3205)).
 
 Paseo does not poll Slurm or interpret the wait id. That policy stays in
 `paseo-slurm`.
+
+## Dropped in v0.8.0
+
+Official `v0.8.0` already ships these former companions. Kept only as retired
+copies under [superseded/](./superseded/):
+
+- Codex reload close-before-resume: [getpaseo/paseo#4353](https://github.com/getpaseo/paseo/pull/4353) supersedes local [#3574](https://github.com/getpaseo/paseo/pull/3574).
+- Codex Fast for GPT-6 Astra: [getpaseo/paseo#4640](https://github.com/getpaseo/paseo/pull/4640) closes [#4451](https://github.com/getpaseo/paseo/issues/4451). Official support is an exact model list, not the old prefix allowlist.
 
 ## Apply
 
@@ -83,10 +85,7 @@ When https://github.com/getpaseo/paseo/pull/3011 (or an equivalent that also
 ships `paseo send --system`) merges into a stable release, drop the
 external-wait patches.
 
-Drop `codex-reload-close-before-resume.patch` when upstream reload closes the
-previous Codex app-server before `thread/resume` and parks a failed
-replacement as a visible `error` agent
-([#3574](https://github.com/getpaseo/paseo/pull/3574)).
-
 Drop `codex-rewind-runtime-mcp.patch` when upstream rewind passes runtime
-`buildCodexInnerConfig()` on `thread/fork` ([#3205](https://github.com/getpaseo/paseo/issues/3205)).
+`buildCodexInnerConfig()` on both legacy and paginated `thread/fork` paths
+([#3205](https://github.com/getpaseo/paseo/issues/3205),
+[#3579](https://github.com/getpaseo/paseo/pull/3579)).
