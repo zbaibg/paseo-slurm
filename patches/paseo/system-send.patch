@@ -8,6 +8,7 @@ should apply external-wait-finish-deferral.patch instead (it already includes
 this).
 
 Rebased onto getpaseo/paseo v0.8.0 (e432c9b47) plus finish deferral.
+Applies unchanged to v0.9.1 (818658520) when finish deferral is already present.
 
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---

@@ -11,7 +11,7 @@ lands the same behavior.
 | Upstream discussion | https://github.com/getpaseo/paseo/discussions/3010 |
 | Upstream draft PR | https://github.com/getpaseo/paseo/pull/3011 (closed unmerged) |
 | Upstream rewind bug | https://github.com/getpaseo/paseo/issues/3205 |
-| Verified against | `getpaseo/paseo` `v0.8.0` (`b8e24677e`) |
+| Verified against | `getpaseo/paseo` `v0.9.1` (`818658520`) |
 | Install | [install-and-patch.md](./install-and-patch.md) — lean CLI/daemon from latest stable |
 
 Do not vendor a resume-MCP rebind for [getpaseo/paseo#3283](https://github.com/getpaseo/paseo/issues/3283): after daemon restart the thread is unloaded, so Paseo already sends the runtime overlay on `thread/resume`. Codex 0.148 honors that. That path is distinct from rewind/`thread/fork` (#3205).

@@ -16,7 +16,10 @@
 # One Paseo daemon on the Human-fixed host compute-0-41. Same ~/.paseo on NFS;
 # do not start a second daemon on kestrel. This script clears a leftover
 # ~/.paseo/paseo.pid and any previous-job worker still bound to 127.0.0.1:6767
-# on this node. After the daemon is healthy,
+# on this node. CLIProxyAPI/claudex is archived (2026-09-19); GPT models go
+# through Eigenwise Model Gateway on the stock claude provider
+# (scripts/ensure-model-gateway.sh, including CCP_COMPACT_EFFORT=off).
+# After the daemon is healthy,
 # reattach watching paseo-slurm groups and retry completed paseo-local callbacks
 # on this node so resume talks to this daemon.
 
@@ -37,6 +40,8 @@ fi
 export NVM_DIR="${HOME}/.nvm"
 # shellcheck source=/dev/null
 . "${NVM_DIR}/nvm.sh"
+# Claude and other user-local CLIs. Do not rely on the submitter PATH.
+export PATH="${HOME}/.local/bin:${PATH}"
 command -v node >/dev/null
 command -v paseo >/dev/null
 command -v paseo-slurm >/dev/null
@@ -236,14 +241,23 @@ echo "paseo=$(command -v paseo) paseo-slurm=$(command -v paseo-slurm) paseo-loca
 echo "TMPDIR=${TMPDIR}"
 paseo --version || true
 
-paseo daemon start \
-  --foreground \
-  --listen 127.0.0.1:6767 \
-  --relay \
-  --home "${HOME}/.paseo" &
+MODEL_GATEWAY_ENSURE="${MODEL_GATEWAY_ENSURE:-/home/zbai29/soft/paseo-slurm/scripts/ensure-model-gateway.sh}"
+if [[ ! -x "${MODEL_GATEWAY_ENSURE}" ]]; then
+  echo "error: missing ${MODEL_GATEWAY_ENSURE}" >&2
+  exit 1
+fi
+"${MODEL_GATEWAY_ENSURE}" --ensure
+
+# v0.9.1 removed `daemon start --foreground/--listen/--relay`. Persistent
+# config already carries those values; set them again so this launch still
+# owns the bind address and relay, then stay in the foreground.
+paseo daemon config set daemon.listen 127.0.0.1:6767 --string --home "${HOME}/.paseo"
+paseo daemon config set daemon.relay.enabled true --home "${HOME}/.paseo"
+paseo daemon run --home "${HOME}/.paseo" &
 daemon_pid=$!
 
 cleanup() {
+  "${MODEL_GATEWAY_ENSURE}" --stop || true
   kill "${daemon_pid}" 2>/dev/null || true
   wait "${daemon_pid}" 2>/dev/null || true
 }

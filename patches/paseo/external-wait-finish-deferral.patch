@@ -10,6 +10,7 @@ hidden <paseo-system> path instead of a user-message bubble.
 Does not include machine-local TMPDIR defaults.
 
 Rebased onto getpaseo/paseo v0.8.0 (e432c9b47).
+Applies unchanged to v0.9.1 (818658520).
 
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---

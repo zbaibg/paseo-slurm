@@ -32,7 +32,7 @@ From this repo (`paseo-slurm`):
 ```
 
 Default build tree: `/var/tmp/paseo-lean` (login-node disk, not CephFS).
-Override with `--src DIR` or `PASEO_LEAN_SRC`. Pin a tag with `--ref v0.8.0`
+Override with `--src DIR` or `PASEO_LEAN_SRC`. Pin a tag with `--ref v0.9.1`
 or `PASEO_LEAN_REF`.
 
 Then load the new server **only** by submitting the compute-node job. Do not
@@ -88,7 +88,7 @@ for an unpatched registry install).
 
 ```bash
 which paseo          # should be ~/.nvm/versions/node/.../bin/paseo
-paseo --version      # e.g. 0.8.0 (stable, not *-beta.*)
+paseo --version      # e.g. 0.9.1 (stable, not *-beta.*)
 paseo send --help    # must list --system
 ```
 
@@ -97,9 +97,9 @@ Global `@getpaseo/server` dist must contain:
 - `getExternalWaitIdFromLabels` in `agent-prompt.js`
 - `issue #3205` in `providers/codex/rewind.js`
 
-The installer checks those markers. Stock v0.8.0 already includes Codex
-close-before-resume reload (#4353) and Astra Fast (#4640); those are not
-companion-patch markers.
+The installer checks those markers. Stock v0.8.0 and v0.9.1 already include
+Codex close-before-resume reload (#4353) and Astra Fast (#4640); those are not
+companion-patch markers. The live companions still apply unchanged on v0.9.1.
 
 ## After upstream merges
 

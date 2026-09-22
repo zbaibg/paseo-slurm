@@ -11,6 +11,7 @@ forks and paginated beforeTurnId forks now receive the overlay.
 Independent of the external-wait patches.
 
 Rebased onto getpaseo/paseo v0.8.0 (e432c9b47).
+Applies unchanged to v0.9.1 (818658520).
 
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
