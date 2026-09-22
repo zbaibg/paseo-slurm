@@ -8,6 +8,7 @@ lands the same behavior.
 | Combined patch | `external-wait-finish-deferral.patch` (deferral + `paseo send --system`) |
 | Incremental patch | `system-send.patch` (only `--system`, for trees that already have deferral) |
 | Codex rewind MCP patch | `codex-rewind-runtime-mcp.patch` (pass runtime MCP config on `thread/fork`) |
+| Gateway 1M launch | `claude-opus-gateway-1m-launch.patch` (send bare 1M catalog ids with `[1m]` only while `ANTHROPIC_BASE_URL` is a gateway) |
 | Upstream discussion | https://github.com/getpaseo/paseo/discussions/3010 |
 | Upstream draft PR | https://github.com/getpaseo/paseo/pull/3011 (closed unmerged) |
 | Upstream rewind bug | https://github.com/getpaseo/paseo/issues/3205 |
@@ -45,6 +46,13 @@ sbatch ./scripts/paseo-compute.sbatch
    path. Without this, the forked thread stays loaded and falls back to the
    Codex base MCP config
    ([getpaseo/paseo#3205](https://github.com/getpaseo/paseo/issues/3205)).
+4. When `ANTHROPIC_BASE_URL` is a gateway rather than `api.anthropic.com`, send
+   bare catalog ids whose window is already 1M — Opus 5, Opus 5.5, Fable 5, and
+   Fable 5.1 — as `${id}[1m]`. Claude Code otherwise budgets those bare ids at
+   200k. The catalog id and the picker stay unchanged. Rows that are their own
+   200k or 1M entries, such as Sonnet 5 and Opus 4.8, are left unchanged. With
+   the base URL unset or pointed at the official API, the id sent to Claude
+   matches stock Paseo.
 
 Paseo does not poll Slurm or interpret the wait id. That policy stays in
 `paseo-slurm`.

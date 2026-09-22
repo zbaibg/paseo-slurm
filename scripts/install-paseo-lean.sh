@@ -8,6 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMBINED="${ROOT}/patches/paseo/external-wait-finish-deferral.patch"
 SYSTEM_SEND="${ROOT}/patches/paseo/system-send.patch"
 CODEX_REWIND="${ROOT}/patches/paseo/codex-rewind-runtime-mcp.patch"
+OPUS_1M="${ROOT}/patches/paseo/claude-opus-gateway-1m-launch.patch"
 APPLY_EXTERNAL="${ROOT}/scripts/apply-paseo-external-wait.sh"
 UPSTREAM_URL="${PASEO_UPSTREAM_URL:-https://github.com/getpaseo/paseo.git}"
 SRC="${PASEO_LEAN_SRC:-/var/tmp/paseo-lean}"
@@ -34,6 +35,7 @@ Applies:
   external-wait-finish-deferral.patch (via apply-paseo-external-wait.sh)
   system-send.patch (only if the tree already has deferral but not --system)
   codex-rewind-runtime-mcp.patch (pass runtime MCP config on Codex rewind thread/fork)
+  claude-opus-gateway-1m-launch.patch (send bare 1M catalog ids as [1m] only for a gateway base URL)
 
 Does not apply retired v0.8.0-upstreamed companions (reload #4353, Astra Fast #4640).
 
@@ -57,7 +59,7 @@ if [[ -z "${REF}" ]]; then
   REF="${PASEO_LEAN_REF:-}"
 fi
 
-if [[ ! -f "${COMBINED}" || ! -f "${SYSTEM_SEND}" || ! -f "${CODEX_REWIND}" || ! -x "${APPLY_EXTERNAL}" ]]; then
+if [[ ! -f "${COMBINED}" || ! -f "${SYSTEM_SEND}" || ! -f "${CODEX_REWIND}" || ! -f "${OPUS_1M}" || ! -x "${APPLY_EXTERNAL}" ]]; then
   echo "error: missing patch files or apply script under ${ROOT}" >&2
   exit 1
 fi
@@ -128,6 +130,13 @@ check_patches() {
     git -C "${SRC}" apply --check "${CODEX_REWIND}" 2>&1 || true
     exit 1
   fi
+  if git -C "${SRC}" apply --check "${OPUS_1M}"; then
+    echo "OK  ${OPUS_1M}"
+  else
+    echo "error: Opus gateway 1M launch patch does not apply" >&2
+    git -C "${SRC}" apply --check "${OPUS_1M}" 2>&1 || true
+    exit 1
+  fi
 }
 
 trim_workspaces() {
@@ -173,7 +182,7 @@ root = os.path.expanduser("~/.nvm/versions/node")
 if not os.path.isdir(root):
     print("warning: ~/.nvm not found; skip dist marker check", file=sys.stderr)
     raise SystemExit(0)
-hits = {"deferral": False, "codex_rewind_mcp": False}
+hits = {"deferral": False, "codex_rewind_mcp": False, "opus_1m": False}
 for dirpath, dirnames, filenames in os.walk(root):
     if "/@getpaseo/server/" not in dirpath.replace("\\", "/"):
         continue
@@ -183,7 +192,10 @@ for dirpath, dirnames, filenames in os.walk(root):
     if "rewind.js" in filenames and dirpath.replace("\\", "/").endswith("/providers/codex"):
         text = open(os.path.join(dirpath, "rewind.js"), encoding="utf-8").read()
         hits["codex_rewind_mcp"] = "issue #3205" in text
-if not hits["deferral"] or not hits["codex_rewind_mcp"]:
+    if "model-manifest.js" in filenames and dirpath.replace("\\", "/").endswith("/providers/claude"):
+        text = open(os.path.join(dirpath, "model-manifest.js"), encoding="utf-8").read()
+        hits["opus_1m"] = "claudeLaunchModelId" in text
+if not hits["deferral"] or not hits["codex_rewind_mcp"] or not hits["opus_1m"]:
     print("error: global @getpaseo/server dist is missing patch markers", hits, file=sys.stderr)
     raise SystemExit(1)
 print("OK  dist markers", hits)
@@ -208,6 +220,13 @@ if grep -Fq "issue #3205" \
 else
   git -C "${SRC}" apply "${CODEX_REWIND}"
   echo "APPLIED ${CODEX_REWIND} -> ${SRC}"
+fi
+if grep -Fq "function claudeLaunchModelId" \
+  "${SRC}/packages/server/src/server/agent/providers/claude/model-manifest.ts"; then
+  echo "ALREADY_APPLIED ${OPUS_1M}"
+else
+  git -C "${SRC}" apply "${OPUS_1M}"
+  echo "APPLIED ${OPUS_1M} -> ${SRC}"
 fi
 
 echo "=== trim workspaces to daemon packages ==="

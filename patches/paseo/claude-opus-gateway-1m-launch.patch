@@ -1,0 +1,247 @@
+From local/paseo-v0.9.1-companion Mon Sep 22 00:00:00 2001
+From: zbai29 <zbai29@wisc.edu>
+Date: Tue, 22 Sep 2026 00:00:00 +0000
+Subject: [PATCH] Launch bare 1M Claude models with the gateway suffix
+
+Claude Code budgets a bare model id at 200k when ANTHROPIC_BASE_URL is not the
+official API. Catalog ids whose window is already 1M, and whose [1m] form is
+not a separate row, are sent with that suffix. The catalog id stays unchanged.
+
+With the base URL unset or set to api.anthropic.com, the id sent to Claude
+matches stock Paseo.
+
+Applies to getpaseo/paseo v0.9.1 (818658520).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+diff --git a/packages/server/src/server/agent/providers/claude/agent.ts b/packages/server/src/server/agent/providers/claude/agent.ts
+index 496dfe268..85d826e25 100644
+--- a/packages/server/src/server/agent/providers/claude/agent.ts
++++ b/packages/server/src/server/agent/providers/claude/agent.ts
+@@ -34,11 +34,13 @@ import {
+   findClaudeModel,
+   getClaudeModelsWithSettings,
+   normalizeClaudeRuntimeModelId,
++  readClaudeSettingsAnthropicBaseUrl,
+   resolveConfiguredClaudeModel,
+ } from "./models.js";
+ import {
+   CLAUDE_DISABLED_THINKING_OPTION_ID,
+   CLAUDE_ULTRACODE_THINKING_OPTION_ID,
++  claudeLaunchModelId,
+   parseClaudeCodeVersion,
+   resolveClaudeDisabledThinkingForModel,
+ } from "./model-manifest.js";
+@@ -2426,8 +2428,10 @@ class ClaudeAgentSession implements AgentSession {
+   async setModel(modelId: string | null): Promise<void> {
+     const normalizedModelId =
+       typeof modelId === "string" && modelId.trim().length > 0 ? modelId.trim() : null;
++    const launchBaseUrl = this.resolveClaudeLaunchBaseUrl();
++    const launchModelId = claudeLaunchModelId(normalizedModelId, launchBaseUrl);
+     const activeQuery = await this.ensureQuery();
+-    await activeQuery.setModel(normalizedModelId ?? undefined);
++    await activeQuery.setModel(typeof launchModelId === "string" ? launchModelId : undefined);
+     this.config.model = normalizedModelId ?? undefined;
+     this.reconcileThinkingOptionForModel(normalizedModelId);
+     if (!claudeModelSupportsFastMode(this.config.model) && this.config.featureValues?.fast_mode) {
+@@ -3241,6 +3245,16 @@ class ClaudeAgentSession implements AgentSession {
+     });
+   }
+ 
++  private resolveClaudeLaunchBaseUrl(
++    env: NodeJS.ProcessEnv = this.buildSdkEnv(),
++  ): string | undefined {
++    const fromEnv = env.ANTHROPIC_BASE_URL;
++    if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
++      return fromEnv.trim();
++    }
++    return readClaudeSettingsAnthropicBaseUrl();
++  }
++
+   private async buildOptions(): Promise<ClaudeOptions> {
+     const { thinking, effort, ultracode } = this.resolveThinkingConfig();
+     const appendedSystemPrompt = this.buildAppendedSystemPrompt();
+@@ -3313,10 +3327,11 @@ class ClaudeAgentSession implements AgentSession {
+       base.mcpServers = this.normalizeMcpServers(this.config.mcpServers);
+     }
+ 
++    const launchBaseUrl = this.resolveClaudeLaunchBaseUrl(sdkEnv);
+     if (this.config.model) {
+-      base.model = this.config.model;
++      base.model = claudeLaunchModelId(this.config.model, launchBaseUrl) ?? this.config.model;
+     }
+-    this.lastOptionsModel = base.model ?? null;
++    this.lastOptionsModel = this.config.model ?? base.model ?? null;
+     if (this.claudeSessionId && !this.pendingFreshSessionId) {
+       base.resume = this.claudeSessionId;
+     }
+diff --git a/packages/server/src/server/agent/providers/claude/model-manifest.ts b/packages/server/src/server/agent/providers/claude/model-manifest.ts
+index c18196c5d..9ddfd6d93 100644
+--- a/packages/server/src/server/agent/providers/claude/model-manifest.ts
++++ b/packages/server/src/server/agent/providers/claude/model-manifest.ts
+@@ -34,6 +34,10 @@ export const CLAUDE_DEFAULT_THINKING_OPTION_ID = "high";
+ export const CLAUDE_DISABLED_THINKING_OPTION_ID = "off";
+ export const CLAUDE_ULTRACODE_THINKING_OPTION_ID = "ultracode";
+ 
++const CLAUDE_ONE_MILLION_SUFFIX = "[1m]";
++const CLAUDE_ONE_MILLION_CONTEXT_TOKENS = 1_000_000;
++const ANTHROPIC_API_HOST = "api.anthropic.com";
++
+ export const CLAUDE_MODEL_MANIFEST = [
+   {
+     id: "claude-opus-5-5",
+@@ -312,6 +316,51 @@ export function isClaudeManifestModelId(modelId: string): boolean {
+   return CLAUDE_MODEL_MANIFEST.some((model) => model.id === modelId);
+ }
+ 
++// Claude Code budgets a bare id at 200k when ANTHROPIC_BASE_URL is not the
++// official API. Direct Anthropic already knows these 1M models, so an unset or
++// official base URL must keep the catalog id.
++export function claudeBaseUrlUsesGateway(baseUrl: string | null | undefined): boolean {
++  if (typeof baseUrl !== "string") {
++    return false;
++  }
++  const trimmed = baseUrl.trim();
++  if (trimmed.length === 0) {
++    return false;
++  }
++  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
++  try {
++    const host = new URL(withScheme).hostname.toLowerCase().replace(/\.$/, "");
++    return host !== ANTHROPIC_API_HOST;
++  } catch {
++    return true;
++  }
++}
++
++export function claudeLaunchModelId(
++  modelId: string | null | undefined,
++  baseUrl?: string | null,
++): string | null | undefined {
++  if (typeof modelId !== "string") {
++    return modelId;
++  }
++  const trimmed = modelId.trim();
++  if (
++    trimmed.length === 0 ||
++    !claudeBaseUrlUsesGateway(baseUrl) ||
++    trimmed.toLowerCase().endsWith(CLAUDE_ONE_MILLION_SUFFIX)
++  ) {
++    return trimmed;
++  }
++  const entry = CLAUDE_MODEL_MANIFEST.find((model) => model.id === trimmed);
++  if (!entry || entry.contextWindowMaxTokens !== CLAUDE_ONE_MILLION_CONTEXT_TOKENS) {
++    return trimmed;
++  }
++  if (isClaudeManifestModelId(`${trimmed}${CLAUDE_ONE_MILLION_SUFFIX}`)) {
++    return trimmed;
++  }
++  return `${trimmed}${CLAUDE_ONE_MILLION_SUFFIX}`;
++}
++
+ export function claudeManifestModelSupportsFastMode(modelId: string | null | undefined): boolean {
+   const normalizedModelId = normalizeClaudeManifestModelId(modelId);
+   if (!normalizedModelId) {
+diff --git a/packages/server/src/server/agent/providers/claude/models.test.ts b/packages/server/src/server/agent/providers/claude/models.test.ts
+index a497826f7..c6c6522ed 100644
+--- a/packages/server/src/server/agent/providers/claude/models.test.ts
++++ b/packages/server/src/server/agent/providers/claude/models.test.ts
+@@ -8,12 +8,19 @@ import { ClaudeAgentClient } from "./agent.js";
+ import {
+   CLAUDE_DISABLED_THINKING_OPTION_ID,
+   CLAUDE_ULTRACODE_THINKING_OPTION_ID,
++  claudeBaseUrlUsesGateway,
++  claudeLaunchModelId,
+   claudeManifestModelSupportsFastMode,
+   normalizeClaudeManifestModelId,
+   parseClaudeCodeVersion,
+   resolveClaudeDisabledThinkingForModel,
+ } from "./model-manifest.js";
+-import { findClaudeModel, getClaudeModels, normalizeClaudeRuntimeModelId } from "./models.js";
++import {
++  findClaudeModel,
++  getClaudeModels,
++  normalizeClaudeRuntimeModelId,
++  readClaudeSettingsAnthropicBaseUrl,
++} from "./models.js";
+ 
+ const createdClaudeConfigDirs: string[] = [];
+ 
+@@ -565,6 +572,42 @@ describe("Claude Opus 5.5 catalog", () => {
+     ).toEqual(["medium"]);
+   });
+ 
++  it("launches bare 1M catalog ids with the suffix only for a gateway base URL", () => {
++    const gateway = "http://127.0.0.1:18764";
++    expect(claudeBaseUrlUsesGateway(gateway)).toBe(true);
++    expect(claudeBaseUrlUsesGateway("https://api.anthropic.com")).toBe(false);
++    expect(claudeBaseUrlUsesGateway("https://api.anthropic.com/v1")).toBe(false);
++    expect(claudeBaseUrlUsesGateway(undefined)).toBe(false);
++    expect(claudeBaseUrlUsesGateway("")).toBe(false);
++
++    for (const modelId of [
++      "claude-opus-5-5",
++      "claude-opus-5",
++      "claude-fable-5",
++      "claude-fable-5-1",
++    ]) {
++      expect(claudeLaunchModelId(modelId, gateway)).toBe(`${modelId}[1m]`);
++      expect(claudeLaunchModelId(modelId)).toBe(modelId);
++      expect(claudeLaunchModelId(modelId, "https://api.anthropic.com")).toBe(modelId);
++    }
++    expect(claudeLaunchModelId("claude-opus-5-5[1m]", gateway)).toBe("claude-opus-5-5[1m]");
++    expect(claudeLaunchModelId("claude-opus-4-8", gateway)).toBe("claude-opus-4-8");
++    expect(claudeLaunchModelId("claude-opus-4-8[1m]", gateway)).toBe("claude-opus-4-8[1m]");
++    expect(claudeLaunchModelId("claude-sonnet-5", gateway)).toBe("claude-sonnet-5");
++    expect(claudeLaunchModelId("claude-sonnet-5[1m]", gateway)).toBe("claude-sonnet-5[1m]");
++  });
++
++  it("reads ANTHROPIC_BASE_URL from Claude settings when the process env is unset", async () => {
++    const configDir = await createClaudeConfigDir({
++      env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:18764" },
++    });
++    expect(readClaudeSettingsAnthropicBaseUrl(configDir)).toBe("http://127.0.0.1:18764");
++    const direct = await createClaudeConfigDir({
++      env: { ANTHROPIC_BASE_URL: "https://api.anthropic.com" },
++    });
++    expect(readClaudeSettingsAnthropicBaseUrl(direct)).toBe("https://api.anthropic.com");
++  });
++
+   it("resolves suffixed and dated Opus 5.5 IDs to the catalog entry", () => {
+     expect(findClaudeModel("claude-opus-5-5[1m]")?.id).toBe("claude-opus-5-5");
+     expect(findClaudeModel("claude-opus-5-5-20260401")?.id).toBe("claude-opus-5-5");
+diff --git a/packages/server/src/server/agent/providers/claude/models.ts b/packages/server/src/server/agent/providers/claude/models.ts
+index c24e5ad36..98a75e721 100644
+--- a/packages/server/src/server/agent/providers/claude/models.ts
++++ b/packages/server/src/server/agent/providers/claude/models.ts
+@@ -1,3 +1,4 @@
++import { readFileSync } from "node:fs";
+ import * as fs from "node:fs/promises";
+ import * as os from "node:os";
+ import * as path from "node:path";
+@@ -119,6 +120,25 @@ function resolveClaudeConfigDir(configDir?: string): string {
+   return configDir ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+ }
+ 
++export function readClaudeSettingsAnthropicBaseUrl(configDir?: string): string | undefined {
++  const settingsPath = path.join(resolveClaudeConfigDir(configDir), "settings.json");
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(readFileSync(settingsPath, "utf8"));
++  } catch {
++    return undefined;
++  }
++  if (!isRecord(parsed) || !isRecord(parsed.env)) {
++    return undefined;
++  }
++  const value = parsed.env.ANTHROPIC_BASE_URL;
++  if (typeof value !== "string") {
++    return undefined;
++  }
++  const trimmed = value.trim();
++  return trimmed.length > 0 ? trimmed : undefined;
++}
++
+ function addSettingsModel(
+   models: AgentModelDefinition[],
+   value: unknown,
