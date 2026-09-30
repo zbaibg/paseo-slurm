@@ -7,15 +7,13 @@ lands the same behavior.
 | --- | --- |
 | Combined patch | `external-wait-finish-deferral.patch` (deferral + `paseo send --system`) |
 | Incremental patch | `system-send.patch` (only `--system`, for trees that already have deferral) |
-| Codex rewind MCP patch | `codex-rewind-runtime-mcp.patch` (pass runtime MCP config on `thread/fork`) |
 | Gateway 1M launch | `claude-opus-gateway-1m-launch.patch` (send bare 1M catalog ids with `[1m]` only while `ANTHROPIC_BASE_URL` is a gateway) |
 | Upstream discussion | https://github.com/getpaseo/paseo/discussions/3010 |
 | Upstream draft PR | https://github.com/getpaseo/paseo/pull/3011 (closed unmerged) |
-| Upstream rewind bug | https://github.com/getpaseo/paseo/issues/3205 |
-| Verified against | `getpaseo/paseo` `v0.9.1` (`818658520`) |
+| Verified against | `getpaseo/paseo` `v0.10.2` (`919c737c1`) |
 | Install | [install-and-patch.md](./install-and-patch.md) — lean CLI/daemon from latest stable |
 
-Do not vendor a resume-MCP rebind for [getpaseo/paseo#3283](https://github.com/getpaseo/paseo/issues/3283): after daemon restart the thread is unloaded, so Paseo already sends the runtime overlay on `thread/resume`. Codex 0.148 honors that. That path is distinct from rewind/`thread/fork` (#3205).
+Do not vendor a resume-MCP rebind for [getpaseo/paseo#3283](https://github.com/getpaseo/paseo/issues/3283): after daemon restart the thread is unloaded, so Paseo already sends the runtime overlay on `thread/resume`. Codex 0.148 honors that. Rewind/`thread/fork` is official since [getpaseo/paseo#5345](https://github.com/getpaseo/paseo/pull/5345) (closes [#3205](https://github.com/getpaseo/paseo/issues/3205)).
 
 These patches do **not** include machine-local defaults such as
 `TMPDIR=/home/zbai29/soft/tmp`. The compute launch script sets that. After
@@ -40,19 +38,14 @@ sbatch ./scripts/paseo-compute.sbatch
    `<paseo-system>` path as child-to-parent finish notifications, so they do
    not appear as a user-message bubble. Without this flag, `paseo-slurm`
    resume attempts fail on stock stable CLI.
-3. Pass the current runtime `buildCodexInnerConfig()` result (injected Paseo
-   MCP endpoint, developer instructions) on Codex `thread/fork` during
-   **Rewind conversation**, including the v0.8.0 paginated `beforeTurnId`
-   path. Without this, the forked thread stays loaded and falls back to the
-   Codex base MCP config
-   ([getpaseo/paseo#3205](https://github.com/getpaseo/paseo/issues/3205)).
-4. When `ANTHROPIC_BASE_URL` is a gateway rather than `api.anthropic.com`, send
-   bare catalog ids whose window is already 1M — Opus 5, Opus 5.5, Fable 5, and
-   Fable 5.1 — as `${id}[1m]`. Claude Code otherwise budgets those bare ids at
-   200k. The catalog id and the picker stay unchanged. Rows that are their own
-   200k or 1M entries, such as Sonnet 5 and Opus 4.8, are left unchanged. With
-   the base URL unset or pointed at the official API, the id sent to Claude
-   matches stock Paseo.
+3. When `ANTHROPIC_BASE_URL` is a gateway rather than `api.anthropic.com`, send
+   bare catalog ids whose window is already 1M — Opus 5, Opus 5.5, Fable 5,
+   Fable 5.1, and Sonnet 5.5 — as `${id}[1m]`. Claude Code otherwise budgets
+   those bare ids at 200k. The catalog id and the picker stay unchanged. Rows
+   that are their own 200k or 1M entries, such as Sonnet 5 and Opus 4.8, are
+   left unchanged. With the base URL unset or pointed at the official API, the
+   id sent to Claude matches stock Paseo. The settings fallback reads
+   `ANTHROPIC_BASE_URL` from the v0.10.2 Claude config directory.
 
 Paseo does not poll Slurm or interpret the wait id. That policy stays in
 `paseo-slurm`.
@@ -64,6 +57,13 @@ copies under [superseded/](./superseded/):
 
 - Codex reload close-before-resume: [getpaseo/paseo#4353](https://github.com/getpaseo/paseo/pull/4353) supersedes local [#3574](https://github.com/getpaseo/paseo/pull/3574).
 - Codex Fast for GPT-6 Astra: [getpaseo/paseo#4640](https://github.com/getpaseo/paseo/pull/4640) closes [#4451](https://github.com/getpaseo/paseo/issues/4451). Official support is an exact model list, not the old prefix allowlist.
+
+## Dropped in v0.10.2
+
+Official `v0.10.2` already passes `buildCodexInnerConfig()` on both Codex
+rewind `thread/fork` paths ([#5345](https://github.com/getpaseo/paseo/pull/5345),
+closes [#3205](https://github.com/getpaseo/paseo/issues/3205)). The local
+`codex-rewind-runtime-mcp.patch` is retired under [superseded/](./superseded/).
 
 ## Apply
 
@@ -92,8 +92,3 @@ If the tree already has finish deferral but not `--system`, it applies
 When https://github.com/getpaseo/paseo/pull/3011 (or an equivalent that also
 ships `paseo send --system`) merges into a stable release, drop the
 external-wait patches.
-
-Drop `codex-rewind-runtime-mcp.patch` when upstream rewind passes runtime
-`buildCodexInnerConfig()` on both legacy and paginated `thread/fork` paths
-([#3205](https://github.com/getpaseo/paseo/issues/3205),
-[#3579](https://github.com/getpaseo/paseo/pull/3579)).

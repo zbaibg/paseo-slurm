@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=paseo-daemon
+#SBATCH --job-name=tasks
 #SBATCH --partition=batch
 #SBATCH --exclude=compute-0-[0-35]
-#SBATCH --nodelist=compute-0-44
+#SBATCH --nodelist=compute-1-2
 #SBATCH --nodes=1
 #SBATCH --exclusive
-#SBATCH --ntasks=8
+#SBATCH --ntasks=32
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=4000M
 #SBATCH --output=/home/zbai29/.paseo/slurm-paseo-%j.out
@@ -19,6 +19,9 @@
 # on this node. CLIProxyAPI/claudex is archived (2026-09-19); GPT models go
 # through Eigenwise Model Gateway on the stock claude provider
 # (scripts/ensure-model-gateway.sh, including CCP_COMPACT_EFFORT=off).
+# Claude PDF rendering needs Poppler (pdftoppm, pdfinfo). The cluster image
+# does not ship it; scripts/ensure-poppler-utils.sh installs a shared
+# conda-forge env and wrappers in ~/.local/bin, which is already on PATH.
 # After the daemon is healthy,
 # reattach watching paseo-slurm groups and retry completed paseo-local callbacks
 # on this node so resume talks to this daemon.
@@ -42,10 +45,20 @@ export NVM_DIR="${HOME}/.nvm"
 . "${NVM_DIR}/nvm.sh"
 # Claude and other user-local CLIs. Do not rely on the submitter PATH.
 export PATH="${HOME}/.local/bin:${PATH}"
+
+POPPLER_ENSURE="${POPPLER_ENSURE:-/home/zbai29/soft/paseo-slurm/scripts/ensure-poppler-utils.sh}"
+if [[ ! -x "${POPPLER_ENSURE}" ]]; then
+  echo "error: missing ${POPPLER_ENSURE}" >&2
+  exit 1
+fi
+"${POPPLER_ENSURE}"
+
 command -v node >/dev/null
 command -v paseo >/dev/null
 command -v paseo-slurm >/dev/null
 command -v paseo-local >/dev/null
+command -v pdftoppm >/dev/null
+command -v pdfinfo >/dev/null
 
 export TMPDIR="${PASEO_TMPDIR:-/home/zbai29/soft/tmp}"
 export TMP="${TMPDIR}"

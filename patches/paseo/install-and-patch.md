@@ -32,7 +32,7 @@ From this repo (`paseo-slurm`):
 ```
 
 Default build tree: `/var/tmp/paseo-lean` (login-node disk, not CephFS).
-Override with `--src DIR` or `PASEO_LEAN_SRC`. Pin a tag with `--ref v0.9.1`
+Override with `--src DIR` or `PASEO_LEAN_SRC`. Pin a tag with `--ref v0.10.2`
 or `PASEO_LEAN_REF`.
 
 Then load the new server **only** by submitting the compute-node job. Do not
@@ -55,9 +55,10 @@ agents. Do not do it from an unattended worker.
 3. `git reset --hard` that release tag so the tree is vanilla.
 4. `git apply --check` on `external-wait-finish-deferral.patch` (or the
    incremental `system-send.patch` if deferral is already present) and on
-   `codex-rewind-runtime-mcp.patch`.
-5. Apply those patches (`scripts/apply-paseo-external-wait.sh` is idempotent;
-   the Codex rewind MCP patch is applied next).
+   `claude-opus-gateway-1m-launch.patch`. Confirm stock rewind already passes
+   `buildCodexInnerConfig()` into `thread/fork`.
+5. Apply the live patches (`scripts/apply-paseo-external-wait.sh` is idempotent;
+   the gateway 1M patch is applied next).
 6. Rewrite root `workspaces` to only:
    `highlight`, `plugin`, `protocol`, `client`, `server`, `relay`, `cli`
    (drops `app`, `website`, `desktop`, `expo-two-way-audio`).
@@ -88,18 +89,20 @@ for an unpatched registry install).
 
 ```bash
 which paseo          # should be ~/.nvm/versions/node/.../bin/paseo
-paseo --version      # e.g. 0.9.1 (stable, not *-beta.*)
+paseo --version      # e.g. 0.10.2 (stable, not *-beta.*)
 paseo send --help    # must list --system
 ```
 
 Global `@getpaseo/server` dist must contain:
 
 - `getExternalWaitIdFromLabels` in `agent-prompt.js`
-- `issue #3205` in `providers/codex/rewind.js`
+- `claudeLaunchModelId` in `providers/claude/model-manifest.js`
+- `config: input.config` in `providers/codex/rewind.js` (official #5345, not a local patch)
 
-The installer checks those markers. Stock v0.8.0 and v0.9.1 already include
-Codex close-before-resume reload (#4353) and Astra Fast (#4640); those are not
-companion-patch markers. The live companions still apply unchanged on v0.9.1.
+The installer checks those markers. Stock v0.8.0 already includes Codex
+close-before-resume reload (#4353) and Astra Fast (#4640). Stock v0.10.2
+already includes the rewind runtime config (#5345). Those are not
+companion-patch markers.
 
 ## After upstream merges
 
@@ -112,10 +115,10 @@ or delete the patch, not force-apply.
 ## Patch notes
 
 See [README.md](./README.md) in this directory for what each patch does.
-`codex-rewind-runtime-mcp.patch` is the #3205 rewind/`thread/fork` fix and is
-applied to both legacy rollback forks and v0.8.0 paginated `beforeTurnId`
-forks. Do not apply a resume-MCP rebind for #3283; Codex 0.148 already honors
-the overlay Paseo sends on `thread/resume` after daemon restart.
+Do not apply a resume-MCP rebind for #3283; Codex 0.148 already honors
+the overlay Paseo sends on `thread/resume` after daemon restart. Do not apply
+the retired rewind patch: official #5345 already sends runtime config on both
+`thread/fork` paths.
 
-Former reload (#3574) and Astra Fast (#4451) companions are retired under
-[superseded/](./superseded/).
+Former reload (#3574), Astra Fast (#4451), and rewind (#3205) companions are
+retired under [superseded/](./superseded/).

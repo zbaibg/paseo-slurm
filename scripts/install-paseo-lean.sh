@@ -7,7 +7,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMBINED="${ROOT}/patches/paseo/external-wait-finish-deferral.patch"
 SYSTEM_SEND="${ROOT}/patches/paseo/system-send.patch"
-CODEX_REWIND="${ROOT}/patches/paseo/codex-rewind-runtime-mcp.patch"
 OPUS_1M="${ROOT}/patches/paseo/claude-opus-gateway-1m-launch.patch"
 APPLY_EXTERNAL="${ROOT}/scripts/apply-paseo-external-wait.sh"
 UPSTREAM_URL="${PASEO_UPSTREAM_URL:-https://github.com/getpaseo/paseo.git}"
@@ -34,10 +33,11 @@ Environment:
 Applies:
   external-wait-finish-deferral.patch (via apply-paseo-external-wait.sh)
   system-send.patch (only if the tree already has deferral but not --system)
-  codex-rewind-runtime-mcp.patch (pass runtime MCP config on Codex rewind thread/fork)
   claude-opus-gateway-1m-launch.patch (send bare 1M catalog ids as [1m] only for a gateway base URL)
 
-Does not apply retired v0.8.0-upstreamed companions (reload #4353, Astra Fast #4640).
+Does not apply retired companions: reload #4353 and Astra Fast #4640 (v0.8.0),
+or Codex rewind runtime MCP (official #5345, in v0.10.2). The installer still
+requires that stock rewind passes buildCodexInnerConfig() into thread/fork.
 
 Does not start or restart the daemon. After install, submit
 scripts/paseo-compute.sbatch; never start Paseo on the login node.
@@ -59,7 +59,7 @@ if [[ -z "${REF}" ]]; then
   REF="${PASEO_LEAN_REF:-}"
 fi
 
-if [[ ! -f "${COMBINED}" || ! -f "${SYSTEM_SEND}" || ! -f "${CODEX_REWIND}" || ! -f "${OPUS_1M}" || ! -x "${APPLY_EXTERNAL}" ]]; then
+if [[ ! -f "${COMBINED}" || ! -f "${SYSTEM_SEND}" || ! -f "${OPUS_1M}" || ! -x "${APPLY_EXTERNAL}" ]]; then
   echo "error: missing patch files or apply script under ${ROOT}" >&2
   exit 1
 fi
@@ -123,11 +123,14 @@ check_patches() {
     git -C "${SRC}" apply --check "${SYSTEM_SEND}" 2>&1 || true
     exit 1
   fi
-  if git -C "${SRC}" apply --check "${CODEX_REWIND}"; then
-    echo "OK  ${CODEX_REWIND}"
+  local rewind_agent="${SRC}/packages/server/src/server/agent/providers/codex-app-server-agent.ts"
+  local rewind_ts="${SRC}/packages/server/src/server/agent/providers/codex/rewind.ts"
+  if grep -Fq 'config: this.buildCodexInnerConfig()' "${rewind_agent}" \
+    && grep -Fq 'input.config ? { config: input.config }' "${rewind_ts}"; then
+    echo "OK  upstream Codex rewind runtime config (getpaseo/paseo#5345); local patch retired"
   else
-    echo "error: Codex rewind MCP patch does not apply" >&2
-    git -C "${SRC}" apply --check "${CODEX_REWIND}" 2>&1 || true
+    echo "error: stock rewind no longer passes runtime Codex config on thread/fork" >&2
+    echo "error: restore a companion patch before installing" >&2
     exit 1
   fi
   if git -C "${SRC}" apply --check "${OPUS_1M}"; then
@@ -191,7 +194,7 @@ for dirpath, dirnames, filenames in os.walk(root):
         hits["deferral"] = "getExternalWaitIdFromLabels" in text
     if "rewind.js" in filenames and dirpath.replace("\\", "/").endswith("/providers/codex"):
         text = open(os.path.join(dirpath, "rewind.js"), encoding="utf-8").read()
-        hits["codex_rewind_mcp"] = "issue #3205" in text
+        hits["codex_rewind_mcp"] = "config: input.config" in text
     if "model-manifest.js" in filenames and dirpath.replace("\\", "/").endswith("/providers/claude"):
         text = open(os.path.join(dirpath, "model-manifest.js"), encoding="utf-8").read()
         hits["opus_1m"] = "claudeLaunchModelId" in text
@@ -214,13 +217,6 @@ fi
 
 echo "=== apply patches ==="
 "${APPLY_EXTERNAL}" "${SRC}"
-if grep -Fq "issue #3205" \
-  "${SRC}/packages/server/src/server/agent/providers/codex/rewind.ts"; then
-  echo "ALREADY_APPLIED ${CODEX_REWIND}"
-else
-  git -C "${SRC}" apply "${CODEX_REWIND}"
-  echo "APPLIED ${CODEX_REWIND} -> ${SRC}"
-fi
 if grep -Fq "function claudeLaunchModelId" \
   "${SRC}/packages/server/src/server/agent/providers/claude/model-manifest.ts"; then
   echo "ALREADY_APPLIED ${OPUS_1M}"
@@ -231,6 +227,12 @@ fi
 
 echo "=== trim workspaces to daemon packages ==="
 trim_workspaces
+
+# git clean leaves gitignored node_modules in place. A nested tree from an
+# older tag (packages/server/node_modules/ajv dated months earlier) is not a
+# complete install and breaks esbuild. Drop every node_modules before install.
+echo "=== drop stale node_modules ==="
+find "${SRC}" -name node_modules -type d -prune -exec rm -rf {} +
 
 echo "=== npm install (no RN/website/desktop) ==="
 (
