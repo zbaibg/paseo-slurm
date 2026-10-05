@@ -9,6 +9,7 @@ COMBINED="${ROOT}/patches/paseo/external-wait-finish-deferral.patch"
 SYSTEM_SEND="${ROOT}/patches/paseo/system-send.patch"
 OPUS_1M="${ROOT}/patches/paseo/claude-opus-gateway-1m-launch.patch"
 BROWSER_DOWNLOAD="${ROOT}/patches/paseo/browser-download.patch"
+GIT_IGNORE="${ROOT}/patches/paseo/workspace-git-ignore.patch"
 APPLY_EXTERNAL="${ROOT}/scripts/apply-paseo-external-wait.sh"
 UPSTREAM_URL="${PASEO_UPSTREAM_URL:-https://github.com/getpaseo/paseo.git}"
 SRC="${PASEO_LEAN_SRC:-/var/tmp/paseo-lean}"
@@ -36,6 +37,7 @@ Applies:
   system-send.patch (only if the tree already has deferral but not --system)
   claude-opus-gateway-1m-launch.patch (send bare 1M catalog ids as [1m] only for a gateway base URL)
   browser-download.patch (daemon-side browser_download tool; no desktop-client change)
+  workspace-git-ignore.patch (daemon.git.ignoredPaths: no daemon git work in those workspaces)
 
 Does not apply retired companions: reload #4353 and Astra Fast #4640 (v0.8.0),
 or Codex rewind runtime MCP (official #5345, in v0.10.2). The installer still
@@ -62,7 +64,7 @@ if [[ -z "${REF}" ]]; then
 fi
 
 if [[ ! -f "${COMBINED}" || ! -f "${SYSTEM_SEND}" || ! -f "${OPUS_1M}" || ! -f "${BROWSER_DOWNLOAD}" \
-  || ! -x "${APPLY_EXTERNAL}" ]]; then
+  || ! -f "${GIT_IGNORE}" || ! -x "${APPLY_EXTERNAL}" ]]; then
   echo "error: missing patch files or apply script under ${ROOT}" >&2
   exit 1
 fi
@@ -150,6 +152,13 @@ check_patches() {
     git -C "${SRC}" apply --check "${BROWSER_DOWNLOAD}" 2>&1 || true
     exit 1
   fi
+  if git -C "${SRC}" apply --check "${GIT_IGNORE}"; then
+    echo "OK  ${GIT_IGNORE}"
+  else
+    echo "error: workspace git ignore patch does not apply" >&2
+    git -C "${SRC}" apply --check "${GIT_IGNORE}" 2>&1 || true
+    exit 1
+  fi
 }
 
 trim_workspaces() {
@@ -195,7 +204,13 @@ root = os.path.expanduser("~/.nvm/versions/node")
 if not os.path.isdir(root):
     print("warning: ~/.nvm not found; skip dist marker check", file=sys.stderr)
     raise SystemExit(0)
-hits = {"deferral": False, "codex_rewind_mcp": False, "opus_1m": False, "browser_download": False}
+hits = {
+    "deferral": False,
+    "codex_rewind_mcp": False,
+    "opus_1m": False,
+    "browser_download": False,
+    "git_ignored_paths": False,
+}
 for dirpath, dirnames, filenames in os.walk(root):
     if "/@getpaseo/server/" not in dirpath.replace("\\", "/"):
         continue
@@ -211,6 +226,9 @@ for dirpath, dirnames, filenames in os.walk(root):
     if "paseo-tools.js" in filenames and dirpath.replace("\\", "/").endswith("/agent/tools"):
         text = open(os.path.join(dirpath, "paseo-tools.js"), encoding="utf-8").read()
         hits["browser_download"] = "registerBrowserDownloadTool" in text
+    if "run-git-command.js" in filenames and dirpath.replace("\\", "/").endswith("/dist/server/utils"):
+        text = open(os.path.join(dirpath, "run-git-command.js"), encoding="utf-8").read()
+        hits["git_ignored_paths"] = "isGitIgnoredPath" in text
 if not all(hits.values()):
     print("error: global @getpaseo/server dist is missing patch markers", hits, file=sys.stderr)
     raise SystemExit(1)
@@ -242,6 +260,12 @@ if [[ -f "${SRC}/packages/server/src/server/browser-tools/download.ts" ]]; then
 else
   git -C "${SRC}" apply "${BROWSER_DOWNLOAD}"
   echo "APPLIED ${BROWSER_DOWNLOAD} -> ${SRC}"
+fi
+if [[ -f "${SRC}/packages/server/src/utils/git-ignored-paths.ts" ]]; then
+  echo "ALREADY_APPLIED ${GIT_IGNORE}"
+else
+  git -C "${SRC}" apply "${GIT_IGNORE}"
+  echo "APPLIED ${GIT_IGNORE} -> ${SRC}"
 fi
 
 echo "=== trim workspaces to daemon packages ==="

@@ -1,0 +1,699 @@
+diff --git a/packages/server/src/server/bootstrap.ts b/packages/server/src/server/bootstrap.ts
+index cfa955e..1cf6cc9 100644
+--- a/packages/server/src/server/bootstrap.ts
++++ b/packages/server/src/server/bootstrap.ts
+@@ -213,6 +213,7 @@ import { createGitMutationService } from "./session/git-mutation/git-mutation-se
+ import { workspaceIdsOnCheckout } from "./workspace-directory.js";
+ import { configureGitProcessPolicy } from "../utils/run-git-command.js";
+ import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
++import { configureGitIgnoredPaths, getGitIgnoredPaths } from "../utils/git-ignored-paths.js";
+ import { resolveFirstAgentPromptTitle } from "./agent/create-agent-title.js";
+ import {
+   createAgentCommand,
+@@ -574,7 +575,15 @@ export async function createPaseoDaemon(
+   dependencies: PaseoDaemonDependencies = {},
+ ): Promise<PaseoDaemon> {
+   configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
++  configureGitIgnoredPaths({
++    env: process.env,
++    configPath: path.join(config.paseoHome, "config.json"),
++  });
+   const logger = rootLogger.child({ module: "bootstrap" });
++  const gitIgnoredPaths = getGitIgnoredPaths();
++  if (gitIgnoredPaths.length > 0) {
++    logger.info({ gitIgnoredPaths }, "Git workspace integration disabled for ignored paths");
++  }
+   const obsoleteTimelineDirectory = path.join(config.paseoHome, "agent-timelines");
+   await rm(obsoleteTimelineDirectory, { recursive: true, force: true }).catch((error) => {
+     logger.warn(
+diff --git a/packages/server/src/server/config-git.test.ts b/packages/server/src/server/config-git.test.ts
+index b8cdc3f..67378e1 100644
+--- a/packages/server/src/server/config-git.test.ts
++++ b/packages/server/src/server/config-git.test.ts
+@@ -86,4 +86,20 @@ describe("daemon Git process config", () => {
+       }).git?.maxProcessConcurrency,
+     ).toBe(7);
+   });
++
++  test("accepts daemon.git.ignoredPaths without changing the process limits", async () => {
++    const home = await createHome({
++      daemon: {
++        git: {
++          maxProcessesPerSecond: 5,
++          ignoredPaths: ["/data/big-repo"],
++        },
++      },
++    });
++
++    expect(loadConfig(home, { env: {} }).git).toEqual({
++      maxProcessesPerSecond: 5,
++      maxProcessConcurrency: 8,
++    });
++  });
+ });
+diff --git a/packages/server/src/server/persisted-config.ts b/packages/server/src/server/persisted-config.ts
+index 40c4150..e20bc0f 100644
+--- a/packages/server/src/server/persisted-config.ts
++++ b/packages/server/src/server/persisted-config.ts
+@@ -254,6 +254,8 @@ export const PersistedConfigSchema = z
+           .object({
+             maxProcessesPerSecond: z.number().int().positive().optional(),
+             maxProcessConcurrency: z.number().int().positive().optional(),
++            // Absolute paths whose workspaces the daemon treats as plain directories (no git).
++            ignoredPaths: z.array(z.string().min(1)).optional(),
+           })
+           .strict()
+           .optional(),
+diff --git a/packages/server/src/server/workspace-git-service.test.ts b/packages/server/src/server/workspace-git-service.test.ts
+index a1d6b39..ff5156e 100644
+--- a/packages/server/src/server/workspace-git-service.test.ts
++++ b/packages/server/src/server/workspace-git-service.test.ts
+@@ -15,6 +15,11 @@ import {
+   WorkspaceGitServiceImpl,
+   type WorkspaceGitRuntimeSnapshot,
+ } from "./workspace-git-service.js";
++import {
++  configureGitIgnoredPaths,
++  GIT_IGNORED_PATHS_ENV,
++  resetGitIgnoredPaths,
++} from "../utils/git-ignored-paths.js";
+ 
+ const REPO_CWD = path.resolve("/tmp/repo");
+ 
+@@ -1438,3 +1443,85 @@ describe("WorkspaceGitServiceImpl", () => {
+     service.dispose();
+   });
+ });
++
++describe("WorkspaceGitServiceImpl with daemon.git.ignoredPaths", () => {
++  beforeEach(() => {
++    vi.useFakeTimers();
++    configureGitIgnoredPaths({ env: { [GIT_IGNORED_PATHS_ENV]: REPO_CWD } });
++  });
++
++  afterEach(() => {
++    resetGitIgnoredPaths();
++    vi.useRealTimers();
++  });
++
++  function createSpiedService() {
++    const spies = {
++      subscribe: vi.fn(async () => ({
++        updateIgnore: vi.fn(async () => {}),
++        unsubscribe: vi.fn(async () => {}),
++      })),
++      getCheckoutStatus: vi.fn(async (cwd: string) => createCheckoutStatus(cwd)),
++      getCheckoutSnapshotFacts: vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd)),
++      getPullRequestStatus: vi.fn(async () => createPullRequestStatusResult()),
++      resolveAbsoluteGitDir: vi.fn(async () => join(REPO_CWD, ".git")),
++      hasOriginRemote: vi.fn(async () => false),
++      runGitFetch: vi.fn(async () => ({ changes: [], error: null })),
++      runGitCommand: vi.fn(async () => ({
++        stdout: `${REPO_CWD}\n`,
++        stderr: "",
++        truncated: false,
++        exitCode: 0,
++        signal: null,
++      })),
++    };
++    return { service: createService(spies), spies };
++  }
++
++  test("an ignored workspace is a plain directory with no git, watcher or forge work", async () => {
++    const { service, spies } = createSpiedService();
++    const listener = vi.fn();
++
++    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, listener);
++    await vi.advanceTimersByTimeAsync(0);
++    await service.refresh(REPO_CWD);
++    service.scheduleRefreshForCwd(REPO_CWD);
++    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
++    const watch = await service.requestWorkingTreeWatch(path.join(REPO_CWD, "sub"), vi.fn());
++    await vi.advanceTimersByTimeAsync(10 * 60_000);
++
++    expect(listener).toHaveBeenCalledWith(
++      expect.objectContaining({ cwd: REPO_CWD, git: expect.objectContaining({ isGit: false }) }),
++    );
++    expect((await service.getSnapshot(REPO_CWD, { force: true, reason: "test" })).git.isGit).toBe(
++      false,
++    );
++    expect(await service.getCheckout(REPO_CWD)).toMatchObject({ isGit: false });
++    expect(watch.repoRoot).toBeNull();
++    for (const spy of Object.values(spies)) {
++      expect(spy).not.toHaveBeenCalled();
++    }
++    expect(service.getMetrics()).toMatchObject({
++      repositoryTargetCount: 0,
++      workingTreeWatchTargetCount: 0,
++      fetchInFlightCount: 0,
++    });
++
++    subscription.unsubscribe();
++    await service.dispose();
++  });
++
++  test("a sibling path that shares the prefix is still observed", async () => {
++    const { service, spies } = createSpiedService();
++    const sibling = `${REPO_CWD}-sibling`;
++
++    const subscription = service.registerWorkspace({ cwd: sibling }, vi.fn());
++    await vi.advanceTimersByTimeAsync(1_000);
++
++    expect(spies.getCheckoutSnapshotFacts).toHaveBeenCalledWith(sibling, expect.anything());
++    expect(spies.subscribe).toHaveBeenCalled();
++
++    subscription.unsubscribe();
++    await service.dispose();
++  });
++});
+diff --git a/packages/server/src/server/workspace-git-service.ts b/packages/server/src/server/workspace-git-service.ts
+index e62720e..ed1ee0d 100644
+--- a/packages/server/src/server/workspace-git-service.ts
++++ b/packages/server/src/server/workspace-git-service.ts
+@@ -54,6 +54,7 @@ import {
+   runGitCommand,
+   type RunGitCommand,
+ } from "../utils/run-git-command.js";
++import { isGitIgnoredPath } from "../utils/git-ignored-paths.js";
+ import { branchNameFromRef } from "../utils/worktree-metadata.js";
+ import { listPaseoWorktrees, type PaseoWorktreeInfo } from "../utils/worktree.js";
+ import { READ_ONLY_GIT_ENV } from "./checkout-git-utils.js";
+@@ -759,6 +760,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
+   async getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
+     this.assertNotDisposed();
+     const normalizedCwd = resolve(cwd);
++    if (isGitIgnoredPath(normalizedCwd)) {
++      return checkoutLiteFromGitSnapshot(normalizedCwd, buildNotGitSnapshot(normalizedCwd).git);
++    }
+     const status = await this.deps.getCheckoutStatus(normalizedCwd, {
+       paseoHome: this.paseoHome,
+       worktreesRoot: this.worktreesRoot,
+@@ -970,6 +974,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
+   ): Promise<{ repoRoot: string | null; unsubscribe: () => void }> {
+     this.assertNotDisposed();
+     cwd = resolve(cwd);
++    if (isGitIgnoredPath(cwd)) {
++      return { repoRoot: null, unsubscribe: () => {} };
++    }
+     const target = await this.ensureWorkingTreeWatchTarget(cwd);
+     target.listeners.add(onChange);
+ 
+@@ -1233,7 +1240,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
+     if (
+       target.observationSetupComplete ||
+       target.observationSetupPromise ||
+-      !this.isActiveObservedWorkspaceTarget(target)
++      !this.isActiveObservedWorkspaceTarget(target) ||
++      isGitIgnoredPath(target.cwd)
+     ) {
+       return;
+     }
+@@ -2734,6 +2742,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
+   }
+ 
+   private startWorkspaceSubscriptionTimers(target: WorkspaceGitTarget): void {
++    if (isGitIgnoredPath(target.cwd)) {
++      return;
++    }
+     if (!target.observationReensureTimer) {
+       const reensureObservation = () => {
+         if (!this.isActiveObservedWorkspaceTarget(target)) {
+@@ -3024,6 +3035,16 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
+     target: WorkspaceGitTarget,
+     request: WorkspaceGitRefreshRequest,
+   ): Promise<WorkspaceGitRuntimeSnapshot> {
++    if (isGitIgnoredPath(target.cwd)) {
++      // daemon.git.ignoredPaths: a plain directory, with no git, forge or watcher work.
++      const snapshot = buildNotGitSnapshot(target.cwd);
++      target.latestSnapshotLoadedAtMs = this.deps.now().getTime();
++      this.rememberSnapshot(target, snapshot, {
++        notify: request.notify,
++        forceEmit: request.emitUnchanged === true,
++      });
++      return Promise.resolve(snapshot);
++    }
+     if (target.refreshState.status === "in-flight") {
+       const active = target.refreshState.request;
+       const addsWork =
+diff --git a/packages/server/src/services/forge-cli-command.ts b/packages/server/src/services/forge-cli-command.ts
+index 798f79c..d50e7ca 100644
+--- a/packages/server/src/services/forge-cli-command.ts
++++ b/packages/server/src/services/forge-cli-command.ts
+@@ -2,6 +2,7 @@ import { z } from "zod";
+ import { findExecutable } from "../executable-resolution/executable-resolution.js";
+ import { runGitCommand } from "../utils/run-git-command.js";
+ import { execCommand } from "../utils/spawn.js";
++import { isGitIgnoredPath, NOT_A_GIT_REPOSITORY_STDERR } from "../utils/git-ignored-paths.js";
+ 
+ /**
+  * Timeout for the per-host CLI auth probe (`gh`/`glab`/`tea` auth status) used
+@@ -102,13 +103,25 @@ export interface ForgeCliRunnerFactory {
+  * trio. The three adapters differ only in the params passed here.
+  */
+ export function createForgeCliRunner(options: CreateForgeCliRunnerOptions): ForgeCliRunnerFactory {
+-  const run: ForgeCliRunner = (args, runOptions) =>
+-    execCommand(options.binary, args, {
++  const run: ForgeCliRunner = (args, runOptions) => {
++    // The forge CLIs run git in their cwd, so an ignored workspace gets no forge process either.
++    if (isGitIgnoredPath(runOptions.cwd)) {
++      return Promise.reject(
++        options.errorClasses.createCommandError({
++          args,
++          cwd: runOptions.cwd,
++          exitCode: 128,
++          stderr: NOT_A_GIT_REPOSITORY_STDERR,
++        }),
++      );
++    }
++    return execCommand(options.binary, args, {
+       cwd: runOptions.cwd,
+       envOverlay: { ...options.envOverlay, ...runOptions.envOverlay },
+       maxBuffer: 10 * 1024 * 1024,
+       timeout: options.timeoutMs,
+     });
++  };
+ 
+   function normalizeError(
+     error: unknown,
+diff --git a/packages/server/src/utils/git-ignored-paths.test.ts b/packages/server/src/utils/git-ignored-paths.test.ts
+new file mode 100644
+index 0000000..1755586
+--- /dev/null
++++ b/packages/server/src/utils/git-ignored-paths.test.ts
+@@ -0,0 +1,183 @@
++import { mkdir, mkdtemp, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
++
++const spawned = vi.hoisted(() => [] as Array<{ command: string; cwd: string | undefined }>);
++
++vi.mock("./spawn.js", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("./spawn.js")>();
++  return {
++    ...actual,
++    spawnProcess: (...args: Parameters<typeof actual.spawnProcess>) => {
++      spawned.push({ command: args[0], cwd: args[2]?.cwd?.toString() });
++      return actual.spawnProcess(...args);
++    },
++    execCommand: (...args: Parameters<typeof actual.execCommand>) => {
++      spawned.push({ command: args[0], cwd: args[2]?.cwd?.toString() });
++      return actual.execCommand(...args);
++    },
++  };
++});
++
++import { createForgeCliRunner } from "../services/forge-cli-command.js";
++import { getCheckoutStatus } from "./checkout-git.js";
++import {
++  configureGitIgnoredPaths,
++  getGitIgnoredPaths,
++  GIT_IGNORED_PATHS_ENV,
++  isGitIgnoredPath,
++  resetGitIgnoredPaths,
++} from "./git-ignored-paths.js";
++import {
++  getGitCommandMetrics,
++  runGitCommand,
++  startGitCommandMetrics,
++  stopGitCommandMetrics,
++} from "./run-git-command.js";
++
++class TestCommandError extends Error {
++  public constructor(public readonly params: { exitCode: number | null; stderr: string }) {
++    super(`test CLI failed (${String(params.exitCode)})`);
++  }
++}
++
++function createTestForgeRunner() {
++  return createForgeCliRunner({
++    binary: "paseo-test-forge-cli-that-does-not-exist",
++    envOverlay: {},
++    timeoutMs: 5_000,
++    isAuthFailureText: () => false,
++    errorClasses: {
++      isAlreadyClassified: () => false,
++      isCommandError: (error): error is TestCommandError & { stderr: string } =>
++        error instanceof TestCommandError,
++      createAuthError: () => new Error("auth"),
++      createMissingError: () => new Error("missing"),
++      createCommandError: (params) => new TestCommandError(params),
++    },
++  });
++}
++
++describe("daemon.git.ignoredPaths", () => {
++  let root: string;
++
++  beforeEach(async () => {
++    root = await realpath(await mkdtemp(path.join(os.tmpdir(), "paseo-git-ignored-")));
++    spawned.length = 0;
++  });
++
++  afterEach(async () => {
++    resetGitIgnoredPaths();
++    await rm(root, { recursive: true, force: true });
++  });
++
++  test("matches the path and its descendants, not siblings sharing a prefix", () => {
++    configureGitIgnoredPaths({
++      env: { [GIT_IGNORED_PATHS_ENV]: `${root}/a/b/::relative/path` },
++    });
++
++    expect(getGitIgnoredPaths()).toEqual([`${root}/a/b`]);
++    expect(isGitIgnoredPath(`${root}/a/b`)).toBe(true);
++    expect(isGitIgnoredPath(`${root}/a/b/`)).toBe(true);
++    expect(isGitIgnoredPath(`${root}/a/b/c/d`)).toBe(true);
++    expect(isGitIgnoredPath(`${root}/a/bc`)).toBe(false);
++    expect(isGitIgnoredPath(`${root}/a/b/../bc`)).toBe(false);
++    expect(isGitIgnoredPath(`${root}/a`)).toBe(false);
++    expect(isGitIgnoredPath("relative/path")).toBe(false);
++  });
++
++  test("follows symlinks in both the workspace cwd and the configured path", async () => {
++    await mkdir(path.join(root, "repo/sub"), { recursive: true });
++    await mkdir(path.join(root, "other/sub"), { recursive: true });
++    await symlink(path.join(root, "repo"), path.join(root, "repo-link"));
++    await symlink(path.join(root, "other"), path.join(root, "other-link"));
++    configureGitIgnoredPaths({
++      env: { [GIT_IGNORED_PATHS_ENV]: `${root}/repo:${root}/other-link` },
++    });
++
++    expect(isGitIgnoredPath(`${root}/repo-link`)).toBe(true);
++    expect(isGitIgnoredPath(`${root}/repo-link/sub`)).toBe(true);
++    expect(isGitIgnoredPath(`${root}/other/sub`)).toBe(true);
++    expect(isGitIgnoredPath(`${root}/other-link/sub`)).toBe(true);
++  });
++
++  test("merges config.json and the environment, and rereads a changed config", async () => {
++    let now = 1_000_000;
++    const configPath = path.join(root, "config.json");
++    await writeFile(
++      configPath,
++      JSON.stringify({ daemon: { git: { ignoredPaths: ["/data/a", "/data/b"] } } }),
++    );
++    configureGitIgnoredPaths({
++      env: { [GIT_IGNORED_PATHS_ENV]: "/data/b:/data/c" },
++      configPath,
++      now: () => now,
++    });
++
++    expect(getGitIgnoredPaths()).toEqual(["/data/a", "/data/b", "/data/c"]);
++
++    await writeFile(configPath, JSON.stringify({ daemon: { git: { ignoredPaths: ["/data/d"] } } }));
++    const later = new Date(Date.now() + 60_000);
++    await utimes(configPath, later, later);
++    now += 4_000;
++    expect(isGitIgnoredPath("/data/a/x")).toBe(true);
++    now += 1_000;
++    expect(isGitIgnoredPath("/data/a/x")).toBe(false);
++    expect(getGitIgnoredPaths()).toEqual(["/data/d", "/data/b", "/data/c"]);
++  });
++
++  test("without configuration nothing is ignored", () => {
++    expect(isGitIgnoredPath(root)).toBe(false);
++    configureGitIgnoredPaths({ env: {} });
++    expect(isGitIgnoredPath(root)).toBe(false);
++  });
++
++  test("git in an ignored cwd answers 'not a git repository' without a process", async () => {
++    const repo = path.join(root, "repo");
++    const plain = path.join(root, "plain");
++    await mkdir(repo);
++    await mkdir(plain);
++    await runGitCommand(["init", "--quiet"], { cwd: repo });
++    configureGitIgnoredPaths({ env: { [GIT_IGNORED_PATHS_ENV]: repo } });
++    spawned.length = 0;
++    startGitCommandMetrics();
++
++    await expect(runGitCommand(["status", "--porcelain"], { cwd: repo })).rejects.toThrow(
++      /not a git repository/,
++    );
++    await expect(
++      runGitCommand(["rev-parse", "--show-toplevel"], { cwd: path.join(repo, "sub/dir") }),
++    ).rejects.toThrow(/exit code: 128/);
++    const accepted = await runGitCommand(["rev-parse", "--git-dir"], {
++      cwd: repo,
++      acceptExitCodes: [0, 128],
++    });
++    expect(accepted).toMatchObject({ exitCode: 128, stdout: "" });
++    expect(await getCheckoutStatus(repo)).toMatchObject({ isGit: false });
++    expect(spawned).toEqual([]);
++    expect(getGitCommandMetrics().submitted).toBe(0);
++
++    await expect(runGitCommand(["rev-parse", "--git-dir"], { cwd: plain })).rejects.toThrow(
++      /not a git repository/i,
++    );
++    expect(spawned).toEqual([{ command: "git", cwd: plain }]);
++    stopGitCommandMetrics();
++
++    resetGitIgnoredPaths();
++    expect(await getCheckoutStatus(repo)).toMatchObject({ isGit: true });
++  });
++
++  test("forge CLIs are not started in an ignored cwd", async () => {
++    const runner = createTestForgeRunner();
++    configureGitIgnoredPaths({ env: { [GIT_IGNORED_PATHS_ENV]: `${root}/repo` } });
++
++    const ignored = await runner.run(["pr", "status"], { cwd: `${root}/repo` }).catch((e) => e);
++    expect(ignored).toBeInstanceOf(TestCommandError);
++    expect((ignored as TestCommandError).params).toMatchObject({ exitCode: 128 });
++    expect(spawned).toEqual([]);
++
++    await runner.run(["pr", "status"], { cwd: root }).catch(() => undefined);
++    expect(spawned).toEqual([{ command: "paseo-test-forge-cli-that-does-not-exist", cwd: root }]);
++  });
++});
+diff --git a/packages/server/src/utils/git-ignored-paths.ts b/packages/server/src/utils/git-ignored-paths.ts
+new file mode 100644
+index 0000000..c7fe426
+--- /dev/null
++++ b/packages/server/src/utils/git-ignored-paths.ts
+@@ -0,0 +1,176 @@
++import { readFileSync, realpathSync, statSync } from "node:fs";
++import { isAbsolute, resolve } from "node:path";
++import { isSameOrDescendantPath } from "../server/path-utils.js";
++
++// Workspaces at or under these paths are plain directories to the daemon: it spawns no git (or
++// forge CLI) process there and sets up no git watchers. Agents' own git commands are untouched.
++export const GIT_IGNORED_PATHS_ENV = "PASEO_GIT_IGNORED_PATHS";
++const CONFIG_RELOAD_INTERVAL_MS = 5_000;
++const REALPATH_CACHE_MAX = 1_000;
++
++// What git itself prints outside a repository. Callers already treat this as "not a checkout".
++export const NOT_A_GIT_REPOSITORY_STDERR =
++  "fatal: not a git repository (or any of the parent directories): .git";
++
++export interface GitIgnoredPathsOptions {
++  env: NodeJS.ProcessEnv;
++  configPath?: string;
++  now?: () => number;
++}
++
++interface GitIgnoredPathsState {
++  env: NodeJS.ProcessEnv;
++  configPath: string | null;
++  now: () => number;
++  configMtimeMs: number | null;
++  lastCheckMs: number;
++  configuredPaths: string[];
++  roots: string[];
++  realpaths: Map<string, string | null>;
++}
++
++let state: GitIgnoredPathsState | null = null;
++
++export function parseGitIgnoredPathsEnv(value: string | undefined): string[] {
++  return (value ?? "").split(":").filter((entry) => entry.trim().length > 0);
++}
++
++export function resolveGitIgnoredPaths(input: {
++  env: NodeJS.ProcessEnv;
++  persisted?: readonly string[];
++}): string[] {
++  const merged = [
++    ...(input.persisted ?? []),
++    ...parseGitIgnoredPathsEnv(input.env[GIT_IGNORED_PATHS_ENV]),
++  ];
++  const paths: string[] = [];
++  for (const entry of merged) {
++    const trimmed = entry.trim();
++    if (!isAbsolute(trimmed)) {
++      continue;
++    }
++    const normalized = resolve(trimmed);
++    if (!paths.includes(normalized)) {
++      paths.push(normalized);
++    }
++  }
++  return paths;
++}
++
++export function configureGitIgnoredPaths(options: GitIgnoredPathsOptions): void {
++  const now = options.now ?? Date.now;
++  state = {
++    env: options.env,
++    configPath: options.configPath ?? null,
++    now,
++    configMtimeMs: null,
++    lastCheckMs: now(),
++    configuredPaths: [],
++    roots: [],
++    realpaths: new Map(),
++  };
++  loadConfiguredPaths(state);
++}
++
++export function resetGitIgnoredPaths(): void {
++  state = null;
++}
++
++export function getGitIgnoredPaths(): string[] {
++  if (!state) {
++    return [];
++  }
++  maybeReload(state);
++  return [...state.configuredPaths];
++}
++
++export function isGitIgnoredPath(cwd: string): boolean {
++  if (!state) {
++    return false;
++  }
++  maybeReload(state);
++  if (state.roots.length === 0) {
++    return false;
++  }
++  const lexical = resolve(cwd);
++  if (state.roots.some((root) => isSameOrDescendantPath(root, lexical))) {
++    return true;
++  }
++  const real = cachedRealpath(state, lexical);
++  return real !== null && state.roots.some((root) => isSameOrDescendantPath(root, real));
++}
++
++function maybeReload(current: GitIgnoredPathsState): void {
++  if (!current.configPath) {
++    return;
++  }
++  const nowMs = current.now();
++  if (nowMs - current.lastCheckMs < CONFIG_RELOAD_INTERVAL_MS) {
++    return;
++  }
++  current.lastCheckMs = nowMs;
++  if (readConfigMtime(current.configPath) !== current.configMtimeMs) {
++    loadConfiguredPaths(current);
++  }
++}
++
++function loadConfiguredPaths(current: GitIgnoredPathsState): void {
++  current.configMtimeMs = current.configPath ? readConfigMtime(current.configPath) : null;
++  const configuredPaths = resolveGitIgnoredPaths({
++    env: current.env,
++    persisted: current.configPath ? readPersistedIgnoredPaths(current.configPath) : [],
++  });
++  const roots = new Set(configuredPaths);
++  for (const path of configuredPaths) {
++    const real = tryRealpath(path);
++    if (real) {
++      roots.add(real);
++    }
++  }
++  current.configuredPaths = configuredPaths;
++  current.roots = [...roots];
++  current.realpaths.clear();
++}
++
++// Reads only daemon.git.ignoredPaths. A missing or unreadable file means no configured paths;
++// the daemon's own config loader reports a malformed file.
++function readPersistedIgnoredPaths(configPath: string): string[] {
++  try {
++    const parsed = JSON.parse(readFileSync(configPath, "utf8")) as {
++      daemon?: { git?: { ignoredPaths?: unknown } };
++    };
++    const paths = parsed.daemon?.git?.ignoredPaths;
++    return Array.isArray(paths) ? paths.filter((entry) => typeof entry === "string") : [];
++  } catch {
++    return [];
++  }
++}
++
++function readConfigMtime(configPath: string): number | null {
++  try {
++    return statSync(configPath).mtimeMs;
++  } catch {
++    return null;
++  }
++}
++
++function cachedRealpath(current: GitIgnoredPathsState, path: string): string | null {
++  const cached = current.realpaths.get(path);
++  if (cached !== undefined) {
++    return cached;
++  }
++  if (current.realpaths.size >= REALPATH_CACHE_MAX) {
++    current.realpaths.clear();
++  }
++  const real = tryRealpath(path);
++  current.realpaths.set(path, real);
++  return real;
++}
++
++function tryRealpath(path: string): string | null {
++  try {
++    return realpathSync(path);
++  } catch {
++    return null;
++  }
++}
+diff --git a/packages/server/src/utils/run-git-command.ts b/packages/server/src/utils/run-git-command.ts
+index bdf7bc1..647ec7b 100644
+--- a/packages/server/src/utils/run-git-command.ts
++++ b/packages/server/src/utils/run-git-command.ts
+@@ -13,6 +13,7 @@ import {
+   submitGitCommandTrace,
+ } from "./git-command-trace.js";
+ import { spawnProcess } from "./spawn.js";
++import { isGitIgnoredPath, NOT_A_GIT_REPOSITORY_STDERR } from "./git-ignored-paths.js";
+ import {
+   GitProcessScheduler,
+   type GitProcessPriority,
+@@ -281,6 +282,9 @@ function executeGitCommand<Output>(
+   decode: (output: Buffer) => Output,
+   provenance?: string,
+ ): Promise<GitCommandResult<Output>> {
++  if (isGitIgnoredPath(options.cwd)) {
++    return Promise.resolve().then(() => ignoredGitCommandResult(args, options, decode));
++  }
+   const metricsState = submitGitCommandMetric(args, options.cwd);
+   const commandTrace = submitGitCommandTrace(args, options.cwd, {
+     active: gitProcessScheduler.activeCount,
+@@ -572,6 +576,28 @@ function executeGitCommand<Output>(
+ 
+ export const runGitCommand: RunGitCommand = runGitCommandWithProvenance;
+ 
++// A cwd under daemon.git.ignoredPaths answers like git run outside a repository, without a
++// process, so every caller takes its existing non-git path.
++function ignoredGitCommandResult<Output>(
++  args: string[],
++  options: GitCommandOptions,
++  decode: (output: Buffer) => Output,
++): GitCommandResult<Output> {
++  const acceptExitCodes = options.acceptExitCodes ?? [0];
++  if (!acceptExitCodes.includes(128)) {
++    throw new Error(
++      `Git command failed: ${formatGitCommand(args)} (exit code: 128, signal: none)\n${NOT_A_GIT_REPOSITORY_STDERR}`,
++    );
++  }
++  return {
++    stdout: decode(Buffer.alloc(0)),
++    stderr: `${NOT_A_GIT_REPOSITORY_STDERR}\n`,
++    truncated: false,
++    exitCode: 128,
++    signal: null,
++  };
++}
++
+ function formatGitCommand(args: string[]): string {
+   return ["git", ...args].join(" ");
+ }
