@@ -48,6 +48,14 @@ sbatch ./scripts/paseo-compute.sbatch
 Submitting a replacement job stops the previous compute-node daemon and its
 agents. Do not do it from an unattended worker.
 
+To load a new install under a daemon that is already running on its host,
+restart only the worker with `scripts/restart-paseo-worker.sh` on that host.
+It detaches, sends the restart, and confirms the new worker by process table
+and `/api/health`. Do not wait on `paseo daemon restart` itself: its
+confirmation polls `daemon.get_status` with a 1 s timeout, and that request
+awaits every provider's availability probe (about 2 s here), so the CLI can
+poll until its 600 s default timeout.
+
 ## What the installer does
 
 1. Resolve stable ref: `v$(npm view @getpaseo/cli version)` (or `--ref`).
