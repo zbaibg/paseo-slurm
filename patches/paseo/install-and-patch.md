@@ -54,11 +54,12 @@ agents. Do not do it from an unattended worker.
 2. Clone or `git fetch --tags` `https://github.com/getpaseo/paseo.git`.
 3. `git reset --hard` that release tag so the tree is vanilla.
 4. `git apply --check` on `external-wait-finish-deferral.patch` (or the
-   incremental `system-send.patch` if deferral is already present) and on
-   `claude-opus-gateway-1m-launch.patch`. Confirm stock rewind already passes
-   `buildCodexInnerConfig()` into `thread/fork`.
+   incremental `system-send.patch` if deferral is already present), on
+   `claude-opus-gateway-1m-launch.patch` and on `browser-download.patch`.
+   Confirm stock rewind already passes `buildCodexInnerConfig()` into
+   `thread/fork`.
 5. Apply the live patches (`scripts/apply-paseo-external-wait.sh` is idempotent;
-   the gateway 1M patch is applied next).
+   the gateway 1M patch and then the browser-download patch are applied next).
 6. Rewrite root `workspaces` to only:
    `highlight`, `plugin`, `protocol`, `client`, `server`, `relay`, `cli`
    (drops `app`, `website`, `desktop`, `expo-two-way-audio`).
@@ -97,6 +98,7 @@ Global `@getpaseo/server` dist must contain:
 
 - `getExternalWaitIdFromLabels` in `agent-prompt.js`
 - `claudeLaunchModelId` in `providers/claude/model-manifest.js`
+- `registerBrowserDownloadTool` in `agent/tools/paseo-tools.js`
 - `config: input.config` in `providers/codex/rewind.js` (official #5345, not a local patch)
 
 The installer checks those markers. Stock v0.8.0 already includes Codex

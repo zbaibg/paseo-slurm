@@ -1,13 +1,14 @@
 # Optional Paseo companion patch
 
-Temporary home for the daemon changes that `paseo-slurm` needs until upstream
-lands the same behavior.
+Temporary home for the daemon changes that `paseo-slurm` and its agents need
+until upstream lands the same behavior.
 
 | Item | Value |
 | --- | --- |
 | Combined patch | `external-wait-finish-deferral.patch` (deferral + `paseo send --system`) |
 | Incremental patch | `system-send.patch` (only `--system`, for trees that already have deferral) |
 | Gateway 1M launch | `claude-opus-gateway-1m-launch.patch` (send bare 1M catalog ids with `[1m]` only while `ANTHROPIC_BASE_URL` is a gateway) |
+| Browser download | `browser-download.patch` (daemon-side `browser_download` MCP tool; the desktop client is unchanged) |
 | Upstream discussion | https://github.com/getpaseo/paseo/discussions/3010 |
 | Upstream draft PR | https://github.com/getpaseo/paseo/pull/3011 (closed unmerged) |
 | Verified against | `getpaseo/paseo` `v0.10.2` (`919c737c1`) |
@@ -46,6 +47,33 @@ sbatch ./scripts/paseo-compute.sbatch
    left unchanged. With the base URL unset or pointed at the official API, the
    id sent to Claude matches stock Paseo. The settings fallback reads
    `ANTHROPIC_BASE_URL` from the v0.10.2 Claude config directory.
+
+4. Add the MCP tool `browser_download`, registered next to the other browser
+   tools when `daemon.browserTools.enabled` is true. It fetches a URL (or the
+   tab's current document) inside a Paseo browser tab with that tab's cookies,
+   keeps the bytes in a page-scoped buffer, hashes them in the page
+   (`crypto.subtle`), reads base64 chunks of 57,000 bytes through ordinary
+   `evaluate` commands, and writes the file on the daemon host after size and
+   SHA-256 checks (temporary file, then `rename`, or `link` when overwrite is
+   off). The model only sees path, bytes, SHA-256, content type, final URL
+   and the magic check. `openInNewTab` handles links that redirect to a signed
+   cross-origin CDN URL. The desktop client caps an evaluate result at 80,000
+   JSON characters, which is why chunks are 57,000 bytes (76,002 characters).
+
+   Optional config in `~/.paseo/config.json`, read on every call:
+
+   ```json
+   { "daemon": { "browserTools": { "enabled": true,
+       "download": { "allowedRoots": ["~/papers", "/scratch/me"], "maxBytes": 209715200 } } } }
+   ```
+
+   Without `allowedRoots` the only allowed root is the calling agent's cwd. A
+   configured list replaces that default. `maxBytes` defaults to 200 MiB and a
+   call's own `maxBytes` cannot exceed it. Error codes include
+   `browser_disabled`, `browser_no_host`, `download_cors_or_network`,
+   `download_http_status`, `download_magic_mismatch`, `download_hash_mismatch`,
+   `download_destination_denied` and `download_destination_exists`. Agents
+   created before the daemon restart do not have the tool.
 
 Paseo does not poll Slurm or interpret the wait id. That policy stays in
 `paseo-slurm`.

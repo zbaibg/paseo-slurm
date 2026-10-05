@@ -8,6 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMBINED="${ROOT}/patches/paseo/external-wait-finish-deferral.patch"
 SYSTEM_SEND="${ROOT}/patches/paseo/system-send.patch"
 OPUS_1M="${ROOT}/patches/paseo/claude-opus-gateway-1m-launch.patch"
+BROWSER_DOWNLOAD="${ROOT}/patches/paseo/browser-download.patch"
 APPLY_EXTERNAL="${ROOT}/scripts/apply-paseo-external-wait.sh"
 UPSTREAM_URL="${PASEO_UPSTREAM_URL:-https://github.com/getpaseo/paseo.git}"
 SRC="${PASEO_LEAN_SRC:-/var/tmp/paseo-lean}"
@@ -34,6 +35,7 @@ Applies:
   external-wait-finish-deferral.patch (via apply-paseo-external-wait.sh)
   system-send.patch (only if the tree already has deferral but not --system)
   claude-opus-gateway-1m-launch.patch (send bare 1M catalog ids as [1m] only for a gateway base URL)
+  browser-download.patch (daemon-side browser_download tool; no desktop-client change)
 
 Does not apply retired companions: reload #4353 and Astra Fast #4640 (v0.8.0),
 or Codex rewind runtime MCP (official #5345, in v0.10.2). The installer still
@@ -59,7 +61,8 @@ if [[ -z "${REF}" ]]; then
   REF="${PASEO_LEAN_REF:-}"
 fi
 
-if [[ ! -f "${COMBINED}" || ! -f "${SYSTEM_SEND}" || ! -f "${OPUS_1M}" || ! -x "${APPLY_EXTERNAL}" ]]; then
+if [[ ! -f "${COMBINED}" || ! -f "${SYSTEM_SEND}" || ! -f "${OPUS_1M}" || ! -f "${BROWSER_DOWNLOAD}" \
+  || ! -x "${APPLY_EXTERNAL}" ]]; then
   echo "error: missing patch files or apply script under ${ROOT}" >&2
   exit 1
 fi
@@ -140,6 +143,13 @@ check_patches() {
     git -C "${SRC}" apply --check "${OPUS_1M}" 2>&1 || true
     exit 1
   fi
+  if git -C "${SRC}" apply --check "${BROWSER_DOWNLOAD}"; then
+    echo "OK  ${BROWSER_DOWNLOAD}"
+  else
+    echo "error: browser_download patch does not apply" >&2
+    git -C "${SRC}" apply --check "${BROWSER_DOWNLOAD}" 2>&1 || true
+    exit 1
+  fi
 }
 
 trim_workspaces() {
@@ -185,7 +195,7 @@ root = os.path.expanduser("~/.nvm/versions/node")
 if not os.path.isdir(root):
     print("warning: ~/.nvm not found; skip dist marker check", file=sys.stderr)
     raise SystemExit(0)
-hits = {"deferral": False, "codex_rewind_mcp": False, "opus_1m": False}
+hits = {"deferral": False, "codex_rewind_mcp": False, "opus_1m": False, "browser_download": False}
 for dirpath, dirnames, filenames in os.walk(root):
     if "/@getpaseo/server/" not in dirpath.replace("\\", "/"):
         continue
@@ -198,7 +208,10 @@ for dirpath, dirnames, filenames in os.walk(root):
     if "model-manifest.js" in filenames and dirpath.replace("\\", "/").endswith("/providers/claude"):
         text = open(os.path.join(dirpath, "model-manifest.js"), encoding="utf-8").read()
         hits["opus_1m"] = "claudeLaunchModelId" in text
-if not hits["deferral"] or not hits["codex_rewind_mcp"] or not hits["opus_1m"]:
+    if "paseo-tools.js" in filenames and dirpath.replace("\\", "/").endswith("/agent/tools"):
+        text = open(os.path.join(dirpath, "paseo-tools.js"), encoding="utf-8").read()
+        hits["browser_download"] = "registerBrowserDownloadTool" in text
+if not all(hits.values()):
     print("error: global @getpaseo/server dist is missing patch markers", hits, file=sys.stderr)
     raise SystemExit(1)
 print("OK  dist markers", hits)
@@ -223,6 +236,12 @@ if grep -Fq "function claudeLaunchModelId" \
 else
   git -C "${SRC}" apply "${OPUS_1M}"
   echo "APPLIED ${OPUS_1M} -> ${SRC}"
+fi
+if [[ -f "${SRC}/packages/server/src/server/browser-tools/download.ts" ]]; then
+  echo "ALREADY_APPLIED ${BROWSER_DOWNLOAD}"
+else
+  git -C "${SRC}" apply "${BROWSER_DOWNLOAD}"
+  echo "APPLIED ${BROWSER_DOWNLOAD} -> ${SRC}"
 fi
 
 echo "=== trim workspaces to daemon packages ==="
