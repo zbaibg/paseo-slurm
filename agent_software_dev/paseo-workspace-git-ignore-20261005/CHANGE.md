@@ -365,3 +365,13 @@ Rollback:
   established here; the patch only removes that possible source.
 - The 15 stale `watching` groups of archived agents are candidates for an
   exact-generation `paseo-slurm abandon` by their owner.
+
+## Deployment executed (2026-10-05 ≈ 18:40, coordinator 93805cae; Human: "做好可以部署")
+- Rollback tarballs of the browser-download install: `~/soft/paseo-rollback/v0.10.2-browser-download-20261005/` (7 files).
+- `--check-only`: all four patches OK, PATCHES_COMPATIBLE v0.10.2 919c737c1. Install: dist markers all True incl.
+  `git_ignored_paths` and `git_disable`.
+- Dry run of `restart-paseo-worker.sh --disable-git --reset-git-throttle`: supervisor 10580, worker 2567403, preview
+  daemon.git={"enabled": false}, no change made. Then the real run was launched (log `~/soft/paseo-rollback/restart-worker-*.log`).
+- Housekeeping before the restart: 16 stale `watching` paseo-slurm groups cancelled with `paseo-slurm group cancel` (no scancel):
+  the 15 listed in the browser-download record plus `6c6081cd-group-1787928183702` (agent "MS", archived, Slurm jobs of
+  2026-08-28). Remaining watching groups: 93805cae-group-1791238234191, 70bf1e30-group-1791233464788.
