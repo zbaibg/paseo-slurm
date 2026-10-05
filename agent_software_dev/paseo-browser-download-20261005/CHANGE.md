@@ -209,3 +209,42 @@ delete when no longer needed.
 - Steps 3–4 launched detached over ssh (`~/soft/paseo-rollback/deploy-restart-20261005.sh`, log `deploy-restart-20261005.log`
   next to it): worker restart, health wait, reattach of watching paseo-slurm groups, `paseo-local recover`.
 - Live smoke test (tests/live-smoke.md) follows with a new agent; result to be appended here.
+
+### Restart outcome and CLI hangs (appended 2026-10-05 by the task agent)
+
+- The worker restarted at 17:35:56 (old worker 10616, new worker 2567403 under
+  supervisor 10580) and `/api/health` answered at the first poll. The
+  `paseo daemon restart --home ~/.paseo` CLI never returned and was killed
+  after about 6 min. `paseo daemon status --json` then hung and was killed
+  after about 1 min.
+- Restart hang cause (daemon log): the CLI confirms the new worker with
+  `daemon.get_status` requests that time out after `min(1 s, remaining)`.
+  On the new worker, all 250 of them between 17:35:56 and 17:42:31 took
+  2.1–2.7 s (about 50 s at 17:38 during agent reload). The handler awaits
+  `listProviderAvailability()`, one `isAvailable()` probe per provider; no
+  git is involved. The CLI therefore never observed the new pid and would
+  have polled to its 600 s default.
+- The `status` CLI uses 1.5 s connect and request timeouts. Its hang
+  coincided with a saturated worker (`project.list` 50 s,
+  `fetch_agent_timeline` 63–111 s, `checkout_status` 42–474 s behind the
+  1-process/s git queue) and was not isolated. At 18:05 it returned in 3.1 s
+  with `workerPid 2567403`.
+- Group reattach walked 1094 group records on NFS and finished at 17:52. The
+  first group failed with `spawnSync paseo ETIMEDOUT`. `paseo-local recover`
+  reported `recovered=0`. Log: `~/soft/paseo-rollback/deploy-restart-20261005.log`.
+- Unintended run: at about 18:09, while checking options, the task agent ran
+  `paseo-slurm recover --help`. `recover` has no `--help`, so it ran a real
+  recovery: `recovered=0 recovered_groups=15 attention_required=0
+  orphan_claims=0`. All 15 new watchers exited at once with "group callback
+  stopped: agent … is archived", so no callback was delivered. These 15
+  groups stay `watching` and are re-armed by every reattach or recover:
+  `21d87c13-group-1787456566725`, `f5b89ff9-group-1787947047621`,
+  `220b4195-group-1787971048501`, `4da592a6-group-1788660652782`,
+  `335484fa-group-1788428972586`, `44cbfca7-group-1788658813743`,
+  `a9465184-group-1788758718973`, `c3d60a51-group-1788975115606`,
+  `06f59e81-group-1789023203735`, `1dbeb0f8-group-1789279130002`,
+  `5cdf2aa5-group-1789443690244`, `c9acbd30-group-1789868992564`,
+  `8c155bff-group-1790055850390`, `237c1c50-group-1790065849345`,
+  `a38c5bb3-group-1790110812355`.
+- Later worker restarts: use `scripts/restart-paseo-worker.sh` on the daemon
+  host (commit `a351e22`).
