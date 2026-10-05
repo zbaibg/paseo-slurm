@@ -74,3 +74,33 @@ install were not touched.
 
 - Outcome: `CHANGE.md`, `evidence/RESULT.md`
 - Source: `patches/paseo/workspace-git-ignore.patch`, `scripts/restart-paseo-worker.sh`
+
+## Amendment 1 - 2026-10-05
+
+The Human decided that the daemon's git integration is useless here and
+asked for a global switch, keeping the per-path ignore as it is:
+
+- `daemon.git.enabled` (default true; false = no git or forge process for
+  any cwd) plus the env override `PASEO_GIT_DISABLED=1`;
+- implemented through the same guard as `ignoredPaths`, i.e. every path
+  ignored, plus a spawn-level refusal of `git`/`gh`/`glab`/`tea`;
+- plugin-source git may be lost, but must fail with a clear message;
+- one log line at startup and on change;
+- folded into `workspace-git-ignore.patch`;
+- `restart-paseo-worker.sh --disable-git` with the same safety checks, and a
+  separate optional `--reset-git-throttle` (remove the 1/1 limits; defaults
+  64/8);
+- the deployment uses `--disable-git` instead of `--set-git-ignored-paths`.
+
+This supersedes the design note above that rejected a global switch: losing
+plugin-source git is now accepted.
+
+Added tests:
+
+- false → zero spawns for any cwd, including a real repository;
+- env override;
+- runtime toggle;
+- default unchanged;
+- schema;
+- plus the earlier neighbouring, build, order and `--check-only` checks.
+
