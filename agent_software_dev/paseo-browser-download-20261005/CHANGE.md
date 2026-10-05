@@ -201,3 +201,11 @@ delete when no longer needed.
   (`paseo-tool-call-detail.ts` is client-side); it shows as a generic tool.
 - If a future desktop client lowers its evaluate cap, downloads fail closed
   with `download_chunk_truncated`; adjust `BROWSER_DOWNLOAD_CHUNK_BYTES`.
+
+## Deployment executed (2026-10-05, coordinator 93805cae, Human: "部署")
+- 17:3x steps 0–2 on kestrel: rollback tarballs in `~/soft/paseo-rollback/v0.10.2-20260929/`; `--check-only` PATCHES_COMPATIBLE
+  v0.10.2 919c737c1 (browser-download OK); install ended `OK dist markers {... 'browser_download': True}`; node-pty linux-x64
+  prebuild present.
+- Steps 3–4 launched detached over ssh (`~/soft/paseo-rollback/deploy-restart-20261005.sh`, log `deploy-restart-20261005.log`
+  next to it): worker restart, health wait, reattach of watching paseo-slurm groups, `paseo-local recover`.
+- Live smoke test (tests/live-smoke.md) follows with a new agent; result to be appended here.
