@@ -16,16 +16,24 @@ DELAY=20
 DRY_RUN=0
 FOREGROUND=0
 IGNORED_PATHS=""
+DISABLE_GIT=0
+RESET_THROTTLE=0
 LOG=""
 
 usage() {
   cat <<'EOF'
-Usage: restart-paseo-worker.sh [--home DIR] [--delay SEC] [--set-git-ignored-paths P1[:P2...]]
+Usage: restart-paseo-worker.sh [--home DIR] [--delay SEC] [--disable-git]
+                               [--set-git-ignored-paths P1[:P2...]] [--reset-git-throttle]
                                [--log FILE] [--dry-run] [--foreground]
 
-  --set-git-ignored-paths  Write daemon.git.ignoredPaths into config.json right before the
-                           restart. Refused unless the installed server has the
-                           workspace-git-ignore patch (an unpatched worker rejects the key).
+  --disable-git            Write daemon.git.enabled=false into config.json right before the
+                           restart: the daemon then starts no git or forge CLI process.
+  --set-git-ignored-paths  Write daemon.git.ignoredPaths right before the restart.
+                           Both are refused unless the installed server has the
+                           workspace-git-ignore patch (an unpatched worker rejects the keys).
+  --reset-git-throttle     Remove daemon.git.maxProcessesPerSecond and maxProcessConcurrency
+                           (defaults 64 and 8). Needs no patch.
+  Config edits are atomic (temporary file + rename) and leave the file at mode 600.
   --dry-run                Check host, supervisor, worker and dist; write the edited config to
                            <log>.config-preview.json; do not restart.
   --foreground             Do not detach (the caller must survive the worker restart).
@@ -38,6 +46,8 @@ while [[ $# -gt 0 ]]; do
     --home) HOME_DIR="$2"; shift 2 ;;
     --delay) DELAY="$2"; shift 2 ;;
     --set-git-ignored-paths) IGNORED_PATHS="$2"; shift 2 ;;
+    --disable-git) DISABLE_GIT=1; shift ;;
+    --reset-git-throttle) RESET_THROTTLE=1; shift ;;
     --log) LOG="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --foreground) FOREGROUND=1; shift ;;
@@ -51,6 +61,8 @@ mkdir -p "$(dirname "${LOG}")"
 if [[ "${FOREGROUND}" -eq 0 && -z "${PASEO_RESTART_WORKER_DETACHED:-}" ]]; then
   args=(--home "${HOME_DIR}" --delay "${DELAY}" --log "${LOG}")
   [[ -n "${IGNORED_PATHS}" ]] && args+=(--set-git-ignored-paths "${IGNORED_PATHS}")
+  [[ "${DISABLE_GIT}" -eq 1 ]] && args+=(--disable-git)
+  [[ "${RESET_THROTTLE}" -eq 1 ]] && args+=(--reset-git-throttle)
   [[ "${DRY_RUN}" -eq 1 ]] && args+=(--dry-run)
   PASEO_RESTART_WORKER_DETACHED=1 setsid nohup "$0" "${args[@]}" </dev/null >/dev/null 2>&1 &
   echo "detached pid=$! log=${LOG}"
@@ -80,26 +92,39 @@ old="$(worker_pid)"
 say "supervisor=${sup} worker=${old:-none}"
 [[ -n "${old}" ]] || { say "ERROR no worker under supervisor ${sup}"; exit 1; }
 
-if [[ -n "${IGNORED_PATHS}" ]]; then
-  dist="$(npm root -g)/@getpaseo/server/dist/server/utils/run-git-command.js"
-  if ! grep -q isGitIgnoredPath "${dist}"; then
-    say "ERROR ${dist} lacks the workspace-git-ignore patch; install first, config left unchanged"
+dist_utils="$(npm root -g)/@getpaseo/server/dist/server/utils"
+require_patch() {
+  if ! grep -q "$2" "${dist_utils}/$1" 2>/dev/null; then
+    say "ERROR ${dist_utils}/$1 lacks $2 (workspace-git-ignore patch); install first, config left unchanged"
     exit 1
   fi
+}
+[[ -n "${IGNORED_PATHS}" ]] && require_patch run-git-command.js isGitIgnoredPath
+[[ "${DISABLE_GIT}" -eq 1 ]] && require_patch git-ignored-paths.js PASEO_GIT_DISABLED
+
+if [[ -n "${IGNORED_PATHS}" || "${DISABLE_GIT}" -eq 1 || "${RESET_THROTTLE}" -eq 1 ]]; then
   target="${HOME_DIR}/config.json"
   [[ "${DRY_RUN}" -eq 1 ]] && target="${LOG}.config-preview.json"
-  python3 - "${HOME_DIR}/config.json" "${target}" "${IGNORED_PATHS}" <<'PY'
+  python3 - "${HOME_DIR}/config.json" "${target}" "${IGNORED_PATHS}" "${DISABLE_GIT}" \
+    "${RESET_THROTTLE}" <<'PY'
 import json, os, sys, tempfile
-source, target, paths = sys.argv[1], sys.argv[2], [p for p in sys.argv[3].split(":") if p]
+source, target, paths, disable, reset = sys.argv[1:6]
 config = json.load(open(source))
-config.setdefault("daemon", {}).setdefault("git", {})["ignoredPaths"] = paths
+git = config.setdefault("daemon", {}).setdefault("git", {})
+if paths:
+    git["ignoredPaths"] = [p for p in paths.split(":") if p]
+if disable == "1":
+    git["enabled"] = False
+if reset == "1":
+    git.pop("maxProcessesPerSecond", None)
+    git.pop("maxProcessConcurrency", None)
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(target)), prefix=".config.json.")
 with os.fdopen(fd, "w") as handle:
     json.dump(config, handle, indent=2)
     handle.write("\n")
 os.chmod(tmp, 0o600)
 os.replace(tmp, target)
-print(f"daemon.git.ignoredPaths={paths} -> {target}")
+print(f"daemon.git={json.dumps(git)} -> {target}")
 PY
 fi
 
@@ -124,6 +149,9 @@ for i in $(seq 1 300); do
   sleep 1
 done
 [[ -n "${new}" ]] || { say "ERROR no healthy replacement worker after 300 s"; exit 1; }
+tail -n 5000 "${HOME_DIR}/daemon.log" \
+  | grep -E "Daemon git integration is disabled|Git workspace integration disabled" | tail -1 \
+  || say "no git-integration line in the last 5000 daemon.log lines"
 
 # Re-send callbacks that failed while the worker was down. Both are idempotent and never
 # resubmit jobs or rerun commands.
