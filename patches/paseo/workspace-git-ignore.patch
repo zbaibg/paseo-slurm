@@ -1,45 +1,71 @@
 diff --git a/packages/server/src/server/bootstrap.ts b/packages/server/src/server/bootstrap.ts
-index cfa955e..1cf6cc9 100644
+index cfa955e..938de68 100644
 --- a/packages/server/src/server/bootstrap.ts
 +++ b/packages/server/src/server/bootstrap.ts
-@@ -213,6 +213,7 @@ import { createGitMutationService } from "./session/git-mutation/git-mutation-se
+@@ -213,6 +213,11 @@ import { createGitMutationService } from "./session/git-mutation/git-mutation-se
  import { workspaceIdsOnCheckout } from "./workspace-directory.js";
  import { configureGitProcessPolicy } from "../utils/run-git-command.js";
  import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
-+import { configureGitIgnoredPaths, getGitIgnoredPaths } from "../utils/git-ignored-paths.js";
++import {
++  configureGitIgnoredPaths,
++  getGitIntegrationStatus,
++  type GitIntegrationStatus,
++} from "../utils/git-ignored-paths.js";
  import { resolveFirstAgentPromptTitle } from "./agent/create-agent-title.js";
  import {
    createAgentCommand,
-@@ -574,7 +575,15 @@ export async function createPaseoDaemon(
-   dependencies: PaseoDaemonDependencies = {},
+@@ -575,6 +580,12 @@ export async function createPaseoDaemon(
  ): Promise<PaseoDaemon> {
    configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
+   const logger = rootLogger.child({ module: "bootstrap" });
 +  configureGitIgnoredPaths({
 +    env: process.env,
 +    configPath: path.join(config.paseoHome, "config.json"),
++    onChange: (status) => logGitIntegrationStatus(logger, status, "changed"),
 +  });
-   const logger = rootLogger.child({ module: "bootstrap" });
-+  const gitIgnoredPaths = getGitIgnoredPaths();
-+  if (gitIgnoredPaths.length > 0) {
-+    logger.info({ gitIgnoredPaths }, "Git workspace integration disabled for ignored paths");
-+  }
++  logGitIntegrationStatus(logger, getGitIntegrationStatus(), "startup");
    const obsoleteTimelineDirectory = path.join(config.paseoHome, "agent-timelines");
    await rm(obsoleteTimelineDirectory, { recursive: true, force: true }).catch((error) => {
      logger.warn(
+@@ -1868,3 +1879,23 @@ async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promi
+     }),
+   );
+ }
++
++function logGitIntegrationStatus(
++  logger: Logger,
++  status: GitIntegrationStatus,
++  when: "startup" | "changed",
++): void {
++  if (!status.enabled) {
++    logger.info(
++      { when, disabledBy: status.disabledBy },
++      "Daemon git integration is disabled: no git or forge CLI processes, watchers or polls",
++    );
++  } else if (status.ignoredPaths.length > 0) {
++    logger.info(
++      { when, gitIgnoredPaths: status.ignoredPaths },
++      "Git workspace integration disabled for ignored paths",
++    );
++  } else if (when === "changed") {
++    logger.info({ when }, "Daemon git integration is enabled for all workspaces");
++  }
++}
 diff --git a/packages/server/src/server/config-git.test.ts b/packages/server/src/server/config-git.test.ts
-index b8cdc3f..67378e1 100644
+index b8cdc3f..374e1c5 100644
 --- a/packages/server/src/server/config-git.test.ts
 +++ b/packages/server/src/server/config-git.test.ts
-@@ -86,4 +86,20 @@ describe("daemon Git process config", () => {
+@@ -86,4 +86,21 @@ describe("daemon Git process config", () => {
        }).git?.maxProcessConcurrency,
      ).toBe(7);
    });
 +
-+  test("accepts daemon.git.ignoredPaths without changing the process limits", async () => {
++  test("accepts daemon.git.enabled and ignoredPaths without changing the process limits", async () => {
 +    const home = await createHome({
 +      daemon: {
 +        git: {
 +          maxProcessesPerSecond: 5,
++          enabled: false,
 +          ignoredPaths: ["/data/big-repo"],
 +        },
 +      },
@@ -52,35 +78,38 @@ index b8cdc3f..67378e1 100644
 +  });
  });
 diff --git a/packages/server/src/server/persisted-config.ts b/packages/server/src/server/persisted-config.ts
-index 40c4150..e20bc0f 100644
+index 40c4150..50a5441 100644
 --- a/packages/server/src/server/persisted-config.ts
 +++ b/packages/server/src/server/persisted-config.ts
-@@ -254,6 +254,8 @@ export const PersistedConfigSchema = z
+@@ -254,6 +254,10 @@ export const PersistedConfigSchema = z
            .object({
              maxProcessesPerSecond: z.number().int().positive().optional(),
              maxProcessConcurrency: z.number().int().positive().optional(),
++            // false: the daemon starts no git or forge CLI process at all (default true).
++            enabled: z.boolean().optional(),
 +            // Absolute paths whose workspaces the daemon treats as plain directories (no git).
 +            ignoredPaths: z.array(z.string().min(1)).optional(),
            })
            .strict()
            .optional(),
 diff --git a/packages/server/src/server/workspace-git-service.test.ts b/packages/server/src/server/workspace-git-service.test.ts
-index a1d6b39..ff5156e 100644
+index a1d6b39..6ff0cc3 100644
 --- a/packages/server/src/server/workspace-git-service.test.ts
 +++ b/packages/server/src/server/workspace-git-service.test.ts
-@@ -15,6 +15,11 @@ import {
+@@ -15,6 +15,12 @@ import {
    WorkspaceGitServiceImpl,
    type WorkspaceGitRuntimeSnapshot,
  } from "./workspace-git-service.js";
 +import {
 +  configureGitIgnoredPaths,
++  GIT_DISABLED_ENV,
 +  GIT_IGNORED_PATHS_ENV,
 +  resetGitIgnoredPaths,
 +} from "../utils/git-ignored-paths.js";
  
  const REPO_CWD = path.resolve("/tmp/repo");
  
-@@ -1438,3 +1443,85 @@ describe("WorkspaceGitServiceImpl", () => {
+@@ -1438,3 +1444,110 @@ describe("WorkspaceGitServiceImpl", () => {
      service.dispose();
    });
  });
@@ -149,6 +178,31 @@ index a1d6b39..ff5156e 100644
 +    });
 +
 +    subscription.unsubscribe();
++    await service.dispose();
++  });
++
++  test("with daemon git disabled every workspace is a plain directory", async () => {
++    configureGitIgnoredPaths({ env: { [GIT_DISABLED_ENV]: "1" } });
++    const { service, spies } = createSpiedService();
++    const listeners = [vi.fn(), vi.fn()];
++    const cwds = [path.resolve("/tmp/other-repo"), path.resolve("/srv/project")];
++
++    const subscriptions = cwds.map((cwd, index) =>
++      service.registerWorkspace({ cwd }, listeners[index]!),
++    );
++    await vi.advanceTimersByTimeAsync(10 * 60_000);
++
++    for (const [index, cwd] of cwds.entries()) {
++      expect(listeners[index]).toHaveBeenCalledWith(
++        expect.objectContaining({ cwd, git: expect.objectContaining({ isGit: false }) }),
++      );
++      expect(await service.getCheckout(cwd)).toMatchObject({ isGit: false });
++    }
++    for (const spy of Object.values(spies)) {
++      expect(spy).not.toHaveBeenCalled();
++    }
++
++    for (const subscription of subscriptions) subscription.unsubscribe();
 +    await service.dispose();
 +  });
 +
@@ -277,10 +331,10 @@ index 798f79c..d50e7ca 100644
      error: unknown,
 diff --git a/packages/server/src/utils/git-ignored-paths.test.ts b/packages/server/src/utils/git-ignored-paths.test.ts
 new file mode 100644
-index 0000000..1755586
+index 0000000..c1cb5ea
 --- /dev/null
 +++ b/packages/server/src/utils/git-ignored-paths.test.ts
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,296 @@
 +import { mkdir, mkdtemp, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 +import os from "node:os";
 +import path from "node:path";
@@ -308,10 +362,14 @@ index 0000000..1755586
 +import {
 +  configureGitIgnoredPaths,
 +  getGitIgnoredPaths,
++  getGitIntegrationStatus,
++  GIT_DISABLED_ENV,
 +  GIT_IGNORED_PATHS_ENV,
++  isDaemonGitDisabled,
 +  isGitIgnoredPath,
 +  resetGitIgnoredPaths,
 +} from "./git-ignored-paths.js";
++import { execCommand } from "./spawn.js";
 +import {
 +  getGitCommandMetrics,
 +  runGitCommand,
@@ -464,12 +522,121 @@ index 0000000..1755586
 +    expect(spawned).toEqual([{ command: "paseo-test-forge-cli-that-does-not-exist", cwd: root }]);
 +  });
 +});
++
++describe("daemon.git.enabled", () => {
++  let root: string;
++  let repo: string;
++  let configPath: string;
++
++  beforeEach(async () => {
++    root = await realpath(await mkdtemp(path.join(os.tmpdir(), "paseo-git-disabled-")));
++    repo = path.join(root, "repo");
++    configPath = path.join(root, "config.json");
++    await mkdir(repo);
++    await runGitCommand(["init", "--quiet"], { cwd: repo });
++    spawned.length = 0;
++  });
++
++  afterEach(async () => {
++    resetGitIgnoredPaths();
++    await rm(root, { recursive: true, force: true });
++  });
++
++  // A distinct future mtime makes each rewrite visible to the reread check.
++  async function writeGitConfig(git: object, mtimeOffsetMs?: number): Promise<void> {
++    await writeFile(configPath, JSON.stringify({ daemon: { git } }));
++    if (mtimeOffsetMs !== undefined) {
++      const mtime = new Date(Date.now() + mtimeOffsetMs);
++      await utimes(configPath, mtime, mtime);
++    }
++  }
++
++  test("false starts no git or forge process for any cwd, including a real repository", async () => {
++    await writeGitConfig({ enabled: false });
++    configureGitIgnoredPaths({ env: {}, configPath });
++    startGitCommandMetrics();
++
++    expect(getGitIntegrationStatus()).toEqual({
++      enabled: false,
++      disabledBy: "config",
++      ignoredPaths: [],
++    });
++    await expect(runGitCommand(["status", "--porcelain"], { cwd: repo })).rejects.toThrow(
++      /not a git repository/,
++    );
++    const clone = await runGitCommand(
++      ["clone", "--no-checkout", "--", "https://example.com/plugin.git", path.join(root, "p")],
++      { cwd: root },
++    ).catch((error: Error) => error);
++    expect((clone as Error).message.split("\n")[1]).toBe(
++      `Paseo daemon git integration is disabled (daemon.git.enabled=false or ${GIT_DISABLED_ENV}); git was not run`,
++    );
++    expect(await getCheckoutStatus(repo)).toMatchObject({ isGit: false });
++    const forge = await createTestForgeRunner()
++      .run(["pr", "status"], { cwd: "/" })
++      .catch((error) => error);
++    expect(forge).toBeInstanceOf(TestCommandError);
++    expect(spawned).toEqual([]);
++    expect(getGitCommandMetrics().submitted).toBe(0);
++    stopGitCommandMetrics();
++
++    // Direct spawns (diagnostics, forge host probes) are refused before a process starts.
++    await expect(execCommand("git", ["--version"])).rejects.toThrow(/not starting git/);
++    await expect(execCommand("/usr/bin/gh", ["--version"])).rejects.toThrow(/not starting gh/);
++  });
++
++  test("PASEO_GIT_DISABLED=1 overrides the config; other values leave it to the config", async () => {
++    await writeGitConfig({ enabled: true });
++    configureGitIgnoredPaths({ env: { [GIT_DISABLED_ENV]: "1" }, configPath });
++    expect(getGitIntegrationStatus()).toMatchObject({ enabled: false, disabledBy: "env" });
++
++    configureGitIgnoredPaths({ env: { [GIT_DISABLED_ENV]: "0" }, configPath });
++    expect(isDaemonGitDisabled()).toBe(false);
++    expect(await getCheckoutStatus(repo)).toMatchObject({ isGit: true });
++  });
++
++  test("a runtime toggle is reread and reported once per change", async () => {
++    let now = 1_000_000;
++    const changes: boolean[] = [];
++    await writeGitConfig({ enabled: false });
++    configureGitIgnoredPaths({
++      env: {},
++      configPath,
++      now: () => now,
++      onChange: (status) => changes.push(status.enabled),
++    });
++    expect(isGitIgnoredPath(repo)).toBe(true);
++
++    await writeGitConfig({ enabled: true }, 60_000);
++    now += 5_000;
++    expect(isGitIgnoredPath(repo)).toBe(false);
++    now += 5_000;
++    expect(isGitIgnoredPath(repo)).toBe(false);
++    await writeGitConfig({ enabled: false, maxProcessesPerSecond: 2 }, 120_000);
++    now += 5_000;
++    expect(isDaemonGitDisabled()).toBe(true);
++    expect(changes).toEqual([true, false]);
++  });
++
++  test("absent or true keeps git on", async () => {
++    await writeGitConfig({ maxProcessesPerSecond: 5 });
++    configureGitIgnoredPaths({ env: {}, configPath });
++
++    expect(getGitIntegrationStatus()).toEqual({
++      enabled: true,
++      disabledBy: null,
++      ignoredPaths: [],
++    });
++    expect(await getCheckoutStatus(repo)).toMatchObject({ isGit: true });
++    expect(spawned.some((entry) => entry.command === "git" && entry.cwd === repo)).toBe(true);
++  });
++});
 diff --git a/packages/server/src/utils/git-ignored-paths.ts b/packages/server/src/utils/git-ignored-paths.ts
 new file mode 100644
-index 0000000..c7fe426
+index 0000000..807ed78
 --- /dev/null
 +++ b/packages/server/src/utils/git-ignored-paths.ts
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,238 @@
 +import { readFileSync, realpathSync, statSync } from "node:fs";
 +import { isAbsolute, resolve } from "node:path";
 +import { isSameOrDescendantPath } from "../server/path-utils.js";
@@ -477,34 +644,57 @@ index 0000000..c7fe426
 +// Workspaces at or under these paths are plain directories to the daemon: it spawns no git (or
 +// forge CLI) process there and sets up no git watchers. Agents' own git commands are untouched.
 +export const GIT_IGNORED_PATHS_ENV = "PASEO_GIT_IGNORED_PATHS";
++// daemon.git.enabled=false, or this variable set to 1/true/yes/on, ignores every path and stops
++// the daemon from starting git or a forge CLI at all.
++export const GIT_DISABLED_ENV = "PASEO_GIT_DISABLED";
 +const CONFIG_RELOAD_INTERVAL_MS = 5_000;
 +const REALPATH_CACHE_MAX = 1_000;
 +
 +// What git itself prints outside a repository. Callers already treat this as "not a checkout".
 +export const NOT_A_GIT_REPOSITORY_STDERR =
 +  "fatal: not a git repository (or any of the parent directories): .git";
++export const DAEMON_GIT_DISABLED_REASON = `Paseo daemon git integration is disabled (daemon.git.enabled=false or ${GIT_DISABLED_ENV})`;
++
++export interface GitIntegrationStatus {
++  enabled: boolean;
++  disabledBy: "config" | "env" | null;
++  ignoredPaths: string[];
++}
 +
 +export interface GitIgnoredPathsOptions {
 +  env: NodeJS.ProcessEnv;
 +  configPath?: string;
 +  now?: () => number;
++  // Called after a config reread changes the status; not called by configure itself.
++  onChange?: (status: GitIntegrationStatus) => void;
 +}
 +
 +interface GitIgnoredPathsState {
 +  env: NodeJS.ProcessEnv;
 +  configPath: string | null;
 +  now: () => number;
++  onChange: ((status: GitIntegrationStatus) => void) | null;
 +  configMtimeMs: number | null;
 +  lastCheckMs: number;
++  disabledBy: GitIntegrationStatus["disabledBy"];
 +  configuredPaths: string[];
 +  roots: string[];
 +  realpaths: Map<string, string | null>;
++}
++
++interface PersistedGitSettings {
++  enabled: boolean;
++  ignoredPaths: string[];
 +}
 +
 +let state: GitIgnoredPathsState | null = null;
 +
 +export function parseGitIgnoredPathsEnv(value: string | undefined): string[] {
 +  return (value ?? "").split(":").filter((entry) => entry.trim().length > 0);
++}
++
++export function parseGitDisabledEnv(value: string | undefined): boolean {
++  return ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
 +}
 +
 +export function resolveGitIgnoredPaths(input: {
@@ -535,8 +725,10 @@ index 0000000..c7fe426
 +    env: options.env,
 +    configPath: options.configPath ?? null,
 +    now,
++    onChange: options.onChange ?? null,
 +    configMtimeMs: null,
 +    lastCheckMs: now(),
++    disabledBy: null,
 +    configuredPaths: [],
 +    roots: [],
 +    realpaths: new Map(),
@@ -548,12 +740,20 @@ index 0000000..c7fe426
 +  state = null;
 +}
 +
-+export function getGitIgnoredPaths(): string[] {
++export function getGitIntegrationStatus(): GitIntegrationStatus {
 +  if (!state) {
-+    return [];
++    return { enabled: true, disabledBy: null, ignoredPaths: [] };
 +  }
 +  maybeReload(state);
-+  return [...state.configuredPaths];
++  return snapshotStatus(state);
++}
++
++export function getGitIgnoredPaths(): string[] {
++  return getGitIntegrationStatus().ignoredPaths;
++}
++
++export function isDaemonGitDisabled(): boolean {
++  return !getGitIntegrationStatus().enabled;
 +}
 +
 +export function isGitIgnoredPath(cwd: string): boolean {
@@ -561,6 +761,9 @@ index 0000000..c7fe426
 +    return false;
 +  }
 +  maybeReload(state);
++  if (state.disabledBy) {
++    return true;
++  }
 +  if (state.roots.length === 0) {
 +    return false;
 +  }
@@ -572,6 +775,14 @@ index 0000000..c7fe426
 +  return real !== null && state.roots.some((root) => isSameOrDescendantPath(root, real));
 +}
 +
++function snapshotStatus(current: GitIgnoredPathsState): GitIntegrationStatus {
++  return {
++    enabled: current.disabledBy === null,
++    disabledBy: current.disabledBy,
++    ignoredPaths: [...current.configuredPaths],
++  };
++}
++
 +function maybeReload(current: GitIgnoredPathsState): void {
 +  if (!current.configPath) {
 +    return;
@@ -581,16 +792,25 @@ index 0000000..c7fe426
 +    return;
 +  }
 +  current.lastCheckMs = nowMs;
-+  if (readConfigMtime(current.configPath) !== current.configMtimeMs) {
-+    loadConfiguredPaths(current);
++  if (readConfigMtime(current.configPath) === current.configMtimeMs) {
++    return;
++  }
++  const before = JSON.stringify(snapshotStatus(current));
++  loadConfiguredPaths(current);
++  const after = snapshotStatus(current);
++  if (JSON.stringify(after) !== before) {
++    current.onChange?.(after);
 +  }
 +}
 +
 +function loadConfiguredPaths(current: GitIgnoredPathsState): void {
 +  current.configMtimeMs = current.configPath ? readConfigMtime(current.configPath) : null;
++  const persisted = current.configPath
++    ? readPersistedGitSettings(current.configPath)
++    : { enabled: true, ignoredPaths: [] };
 +  const configuredPaths = resolveGitIgnoredPaths({
 +    env: current.env,
-+    persisted: current.configPath ? readPersistedIgnoredPaths(current.configPath) : [],
++    persisted: persisted.ignoredPaths,
 +  });
 +  const roots = new Set(configuredPaths);
 +  for (const path of configuredPaths) {
@@ -599,22 +819,31 @@ index 0000000..c7fe426
 +      roots.add(real);
 +    }
 +  }
++  if (parseGitDisabledEnv(current.env[GIT_DISABLED_ENV])) {
++    current.disabledBy = "env";
++  } else {
++    current.disabledBy = persisted.enabled ? null : "config";
++  }
 +  current.configuredPaths = configuredPaths;
 +  current.roots = [...roots];
 +  current.realpaths.clear();
 +}
 +
-+// Reads only daemon.git.ignoredPaths. A missing or unreadable file means no configured paths;
-+// the daemon's own config loader reports a malformed file.
-+function readPersistedIgnoredPaths(configPath: string): string[] {
++// Reads only daemon.git.enabled and daemon.git.ignoredPaths. A missing or unreadable file means
++// the defaults; the daemon's own config loader reports a malformed file.
++function readPersistedGitSettings(configPath: string): PersistedGitSettings {
 +  try {
 +    const parsed = JSON.parse(readFileSync(configPath, "utf8")) as {
-+      daemon?: { git?: { ignoredPaths?: unknown } };
++      daemon?: { git?: { enabled?: unknown; ignoredPaths?: unknown } };
 +    };
-+    const paths = parsed.daemon?.git?.ignoredPaths;
-+    return Array.isArray(paths) ? paths.filter((entry) => typeof entry === "string") : [];
++    const git = parsed.daemon?.git;
++    const paths = git?.ignoredPaths;
++    return {
++      enabled: git?.enabled !== false,
++      ignoredPaths: Array.isArray(paths) ? paths.filter((entry) => typeof entry === "string") : [],
++    };
 +  } catch {
-+    return [];
++    return { enabled: true, ignoredPaths: [] };
 +  }
 +}
 +
@@ -647,18 +876,23 @@ index 0000000..c7fe426
 +  }
 +}
 diff --git a/packages/server/src/utils/run-git-command.ts b/packages/server/src/utils/run-git-command.ts
-index bdf7bc1..647ec7b 100644
+index bdf7bc1..7d64a4d 100644
 --- a/packages/server/src/utils/run-git-command.ts
 +++ b/packages/server/src/utils/run-git-command.ts
-@@ -13,6 +13,7 @@ import {
+@@ -13,6 +13,12 @@ import {
    submitGitCommandTrace,
  } from "./git-command-trace.js";
  import { spawnProcess } from "./spawn.js";
-+import { isGitIgnoredPath, NOT_A_GIT_REPOSITORY_STDERR } from "./git-ignored-paths.js";
++import {
++  DAEMON_GIT_DISABLED_REASON,
++  isDaemonGitDisabled,
++  isGitIgnoredPath,
++  NOT_A_GIT_REPOSITORY_STDERR,
++} from "./git-ignored-paths.js";
  import {
    GitProcessScheduler,
    type GitProcessPriority,
-@@ -281,6 +282,9 @@ function executeGitCommand<Output>(
+@@ -281,6 +287,9 @@ function executeGitCommand<Output>(
    decode: (output: Buffer) => Output,
    provenance?: string,
  ): Promise<GitCommandResult<Output>> {
@@ -668,26 +902,30 @@ index bdf7bc1..647ec7b 100644
    const metricsState = submitGitCommandMetric(args, options.cwd);
    const commandTrace = submitGitCommandTrace(args, options.cwd, {
      active: gitProcessScheduler.activeCount,
-@@ -572,6 +576,28 @@ function executeGitCommand<Output>(
+@@ -572,6 +581,32 @@ function executeGitCommand<Output>(
  
  export const runGitCommand: RunGitCommand = runGitCommandWithProvenance;
  
-+// A cwd under daemon.git.ignoredPaths answers like git run outside a repository, without a
-+// process, so every caller takes its existing non-git path.
++// A cwd under daemon.git.ignoredPaths (every cwd when daemon.git.enabled is false) answers like
++// git run outside a repository, without a process, so every caller takes its existing non-git
++// path. With git disabled the first stderr line says so, for callers such as plugin sources.
 +function ignoredGitCommandResult<Output>(
 +  args: string[],
 +  options: GitCommandOptions,
 +  decode: (output: Buffer) => Output,
 +): GitCommandResult<Output> {
++  const stderr = isDaemonGitDisabled()
++    ? `${DAEMON_GIT_DISABLED_REASON}; git was not run\n${NOT_A_GIT_REPOSITORY_STDERR}`
++    : NOT_A_GIT_REPOSITORY_STDERR;
 +  const acceptExitCodes = options.acceptExitCodes ?? [0];
 +  if (!acceptExitCodes.includes(128)) {
 +    throw new Error(
-+      `Git command failed: ${formatGitCommand(args)} (exit code: 128, signal: none)\n${NOT_A_GIT_REPOSITORY_STDERR}`,
++      `Git command failed: ${formatGitCommand(args)} (exit code: 128, signal: none)\n${stderr}`,
 +    );
 +  }
 +  return {
 +    stdout: decode(Buffer.alloc(0)),
-+    stderr: `${NOT_A_GIT_REPOSITORY_STDERR}\n`,
++    stderr: `${stderr}\n`,
 +    truncated: false,
 +    exitCode: 128,
 +    signal: null,
@@ -697,3 +935,56 @@ index bdf7bc1..647ec7b 100644
  function formatGitCommand(args: string[]): string {
    return ["git", ...args].join(" ");
  }
+diff --git a/packages/server/src/utils/spawn.ts b/packages/server/src/utils/spawn.ts
+index 8fac115..fac94fd 100644
+--- a/packages/server/src/utils/spawn.ts
++++ b/packages/server/src/utils/spawn.ts
+@@ -1,8 +1,9 @@
+ import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+-import { extname } from "node:path";
++import { basename, extname } from "node:path";
+ import { promisify } from "node:util";
+ 
+ import { createExternalCommandProcessEnv, type ProcessEnvRecord } from "../server/paseo-env.js";
++import { DAEMON_GIT_DISABLED_REASON, isDaemonGitDisabled } from "./git-ignored-paths.js";
+ import {
+   isWindowsCommandScript,
+   quoteWindowsArgument,
+@@ -10,6 +11,21 @@ import {
+ } from "./windows-command.js";
+ 
+ const execFileAsync = promisify(execFile);
++const DAEMON_GIT_COMMANDS = new Set(["git", "gh", "glab", "tea"]);
++
++// Backstop for daemon.git.enabled=false: the daemon itself starts no git or forge CLI, whatever
++// the caller or cwd. Agents and terminals run in their own processes and are not affected.
++function assertDaemonGitCommandAllowed(command: string): void {
++  if (!isDaemonGitDisabled()) {
++    return;
++  }
++  const name = basename(command)
++    .replace(/\.(exe|cmd|bat)$/i, "")
++    .toLowerCase();
++  if (DAEMON_GIT_COMMANDS.has(name)) {
++    throw new Error(`${DAEMON_GIT_DISABLED_REASON}; not starting ${name}`);
++  }
++}
+ 
+ interface ExternalEnvOptions {
+   baseEnv?: ProcessEnvRecord;
+@@ -57,6 +73,7 @@ export function spawnProcess(
+   args: string[],
+   options?: SpawnProcessOptions,
+ ): ChildProcess {
++  assertDaemonGitCommandAllowed(command);
+   const { baseEnv, env, envOverlay, ...spawnOptions } = options ?? {};
+   const resolvedBaseEnv = env ?? baseEnv ?? process.env;
+   const isWindows = process.platform === "win32";
+@@ -88,6 +105,7 @@ export async function execCommand(
+   args: string[],
+   options?: ExecCommandOptions,
+ ): Promise<ExecCommandResult> {
++  assertDaemonGitCommandAllowed(command);
+   const { baseEnv, env, envOverlay } = options ?? {};
+   const resolvedBaseEnv = env ?? baseEnv ?? process.env;
+   const isWindows = process.platform === "win32";

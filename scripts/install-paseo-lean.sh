@@ -37,7 +37,7 @@ Applies:
   system-send.patch (only if the tree already has deferral but not --system)
   claude-opus-gateway-1m-launch.patch (send bare 1M catalog ids as [1m] only for a gateway base URL)
   browser-download.patch (daemon-side browser_download tool; no desktop-client change)
-  workspace-git-ignore.patch (daemon.git.ignoredPaths: no daemon git work in those workspaces)
+  workspace-git-ignore.patch (daemon.git.enabled=false / daemon.git.ignoredPaths: no daemon git work)
 
 Does not apply retired companions: reload #4353 and Astra Fast #4640 (v0.8.0),
 or Codex rewind runtime MCP (official #5345, in v0.10.2). The installer still
@@ -210,6 +210,7 @@ hits = {
     "opus_1m": False,
     "browser_download": False,
     "git_ignored_paths": False,
+    "git_disable": False,
 }
 for dirpath, dirnames, filenames in os.walk(root):
     if "/@getpaseo/server/" not in dirpath.replace("\\", "/"):
@@ -229,6 +230,9 @@ for dirpath, dirnames, filenames in os.walk(root):
     if "run-git-command.js" in filenames and dirpath.replace("\\", "/").endswith("/dist/server/utils"):
         text = open(os.path.join(dirpath, "run-git-command.js"), encoding="utf-8").read()
         hits["git_ignored_paths"] = "isGitIgnoredPath" in text
+    if "git-ignored-paths.js" in filenames and dirpath.replace("\\", "/").endswith("/dist/server/utils"):
+        text = open(os.path.join(dirpath, "git-ignored-paths.js"), encoding="utf-8").read()
+        hits["git_disable"] = "PASEO_GIT_DISABLED" in text
 if not all(hits.values()):
     print("error: global @getpaseo/server dist is missing patch markers", hits, file=sys.stderr)
     raise SystemExit(1)

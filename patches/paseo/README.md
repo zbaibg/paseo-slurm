@@ -9,7 +9,7 @@ until upstream lands the same behavior.
 | Incremental patch | `system-send.patch` (only `--system`, for trees that already have deferral) |
 | Gateway 1M launch | `claude-opus-gateway-1m-launch.patch` (send bare 1M catalog ids with `[1m]` only while `ANTHROPIC_BASE_URL` is a gateway) |
 | Browser download | `browser-download.patch` (daemon-side `browser_download` MCP tool; the desktop client is unchanged) |
-| Workspace git ignore | `workspace-git-ignore.patch` (`daemon.git.ignoredPaths`: no daemon git, forge CLI or watcher work in those workspaces) |
+| Workspace git ignore / off | `workspace-git-ignore.patch` (`daemon.git.enabled: false` or `daemon.git.ignoredPaths`: no daemon git, forge CLI or watcher work, everywhere or in those workspaces) |
 | Upstream discussion | https://github.com/getpaseo/paseo/discussions/3010 |
 | Upstream draft PR | https://github.com/getpaseo/paseo/pull/3011 (closed unmerged) |
 | Verified against | `getpaseo/paseo` `v0.10.2` (`919c737c1`) |
@@ -89,14 +89,27 @@ sbatch ./scripts/paseo-compute.sbatch
      no file observer, fallback polling, repository watcher, background
      fetch or PR status poll for it.
 
+   `daemon.git.enabled: false` (default true) or `PASEO_GIT_DISABLED=1`
+   (1/true/yes/on; overrides the config) treats every path as ignored, and
+   `utils/spawn.ts` then refuses to start `git`, `gh`, `glab` or `tea` for
+   any caller, so diagnostics and forge host probes start nothing either.
+   The worker logs one line at startup and one on each change ("Daemon git
+   integration is disabled: …"). With git off, branch/diff/PR panels,
+   Paseo worktree creation and git-sourced plugins are unavailable; plugin
+   installs fail with "Paseo daemon git integration is disabled
+   (daemon.git.enabled=false or PASEO_GIT_DISABLED); git was not run".
+   Reconciliation marks every project `non_git` and every workspace a
+   directory; nothing is archived, and turning git back on restores them.
+
    Agents' own git commands are separate processes and are not affected.
-   `config.json` is reread at most every 5 s, so a changed list stops git
-   spawns without a restart; watchers that a workspace set up before it was
-   ignored stop only at the next worker restart. `daemon.git` is a strict
-   schema: an unpatched daemon or CLI rejects a `config.json` that contains
-   `ignoredPaths`, so write the key only after installing this patch and
-   remove it before rolling back. `scripts/restart-paseo-worker.sh
-   --set-git-ignored-paths` does both steps in that order.
+   `config.json` is reread at most every 5 s, so a changed setting stops git
+   spawns without a restart; watchers set up before the change stop only at
+   the next worker restart, and turning git back on takes full effect after
+   a restart. `daemon.git` is a strict schema: an unpatched daemon or CLI
+   rejects a `config.json` that contains `enabled` or `ignoredPaths`, so
+   write them only after installing this patch and remove them before
+   rolling back. `scripts/restart-paseo-worker.sh --disable-git` (or
+   `--set-git-ignored-paths`) does both steps in that order.
 
 Paseo does not poll Slurm or interpret the wait id. That policy stays in
 `paseo-slurm`.
