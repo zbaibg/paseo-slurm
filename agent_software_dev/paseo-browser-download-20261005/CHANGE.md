@@ -248,3 +248,131 @@ delete when no longer needed.
   `a38c5bb3-group-1790110812355`.
 - Later worker restarts: use `scripts/restart-paseo-worker.sh` on the daemon
   host (commit `a351e22`).
+
+## Live smoke test (2026-10-05, coordinator 93805cae; real Electron host, Mac client, UW network)
+
+Run per `tests/live-smoke.md` on the deployed build (commit `cc0ff9c` patch).
+
+- **PASS, arXiv 1706.03762v7, plain mode:** 2,215,244 B in 39 chunks. The
+  SHA-256 `bdfaa68d…2df697` matched three ways: an independent in-page
+  fetch with `crypto.subtle`, the tool result, and `sha256sum` on disk. The
+  file starts with `%PDF-` and `pdfinfo` reports 15 pages. About 6.5 s
+  including model overhead.
+- **PASS, arXiv with `openInNewTab`:** same SHA-256, and the tab was closed
+  afterwards.
+- **PASS, refusals:** `download_destination_exists`;
+  `download_magic_mismatch` on the abs page ("Nothing was written");
+  `download_destination_denied` for a `/tmp` path.
+- **PASS, real use (ACS, paywalled):** Bondi, J. Phys. Chem. 1964,
+  `https://pubs.acs.org/jpchax/article-pdf/68/3/441/10731825/j100785a001.pdf`,
+  plain mode from the article tab: 1,049,975 B in 19 chunks, hash verified.
+  Cloudflare cleared by itself within a few seconds on the article page.
+- **DEFECT, `openInNewTab` on the same ACS PDF URL:** failed with
+  `browser_timeout` "Timed out waiting for browser tab f877a84b-… to
+  register with the browser automation host" and left a tab open on
+  `https://example.com/` (closed by hand).
+
+## Defect and fix (task agent, `92380a0`)
+
+Cause, from the desktop app's `new_tab` handler
+(`packages/app/src/desktop/browser/automation/handler.ts`,
+`openBrowserTabForRequest`):
+
+- `new_tab` without a URL opens `https://example.com`. The tool called
+  `new_tab` with no URL and then `navigate`.
+- The app waits a fixed 5 s (`waitForBrowserRegistration`, `timeoutMs ??
+  5_000`, not settable from a request) for the tab to appear in its
+  automation host's tab list. It then answers `browser_timeout`, naming the
+  tab, but leaves the tab open.
+- The tool's cleanup ran only for a tab id it had received, so a
+  timed-out tab was never closed.
+- `close_tab` is handled from the app's own stores and works for a tab that
+  never registered.
+
+Fix in `browser-tools/download.ts`:
+
+- Open the target URL directly: `new_tab {url}`, with no `navigate`.
+- On a registration timeout, take the tab id from the message (validated
+  against the protocol's browser id pattern) and poll `list_tabs` until it
+  appears, for up to 60 s (`tabRegistrationWaitMs`).
+- If the message does not name the tab, compare `list_tabs` before and
+  after. Adopt new tabs on the target URL, or the single new tab
+  (redirects change the URL); several unrelated new tabs are left alone.
+- Wait for the page by polling `document.readyState === "complete"` with an
+  http(s) `location.href`, up to `timeoutMs`; otherwise fail with
+  `download_timeout`.
+- Record every tab created, or named in a timeout, and close all of them in
+  the tool's `finally`: on success, registration timeout, load timeout and
+  transfer errors.
+
+Tests (`download.test.ts`). The fake broker now models the app: `new_tab`
+opens its URL, registration is immediate, delayed by N list polls, or
+never, using the app's exact timeout message; an unregistered tab answers
+tab-not-found; closes are recorded.
+
+- 4 new tests:
+  - late registration: the tab is used, then closed;
+  - registration never happens: `browser_timeout`, the tab is closed,
+    nothing written;
+  - an unnamed timeout: the new tab from the list is closed;
+  - a page that never finishes loading: `download_timeout`, the tab is
+    closed.
+- The existing `openInNewTab` test now also asserts `new_tab {url}` and no
+  `navigate`.
+- Results: 19/19 in the file; 206 in browser-tools plus the MCP server.
+- Mutation checks:
+  - not recording the timed-out tab: 2 tests fail;
+  - `new_tab` without a URL: 2 fail;
+  - no `finally` close: 4 fail.
+- Typecheck and lint clean. `npm run build:server` passes with all four
+  patches.
+- All 24 application orders apply.
+- `--check-only`: OK for all four patches.
+- The new dist marker `browser_download_new_tab` is True.
+
+Not checked on the real host: whether a 60 s wait covers slow
+registrations there, and the page-load wait on a Cloudflare interstitial.
+The tool fetches once the first load completes; an interstitial that
+redirects later gives `download_magic_mismatch`. In that case use plain
+mode from the article tab, which worked for ACS.
+
+## Deployment of the fix (prepared, not executed)
+
+On kestrel, in `/home/zbai29/soft/paseo-slurm`:
+
+```bash
+# 0. Keep the current install (git switch, 18:38) for rollback; the installer deletes *.tgz
+mkdir -p ~/soft/paseo-rollback/v0.10.2-git-switch-20261005
+cp /var/tmp/paseo-lean/getpaseo-*-0.10.2.tgz ~/soft/paseo-rollback/v0.10.2-git-switch-20261005/
+# 1. Must print OK for all four patches and PATCHES_COMPATIBLE v0.10.2 919c737c1
+./scripts/install-paseo-lean.sh --check-only --ref v0.10.2
+# 2. Must end with: OK  dist markers {..., 'browser_download_new_tab': True, ...}
+./scripts/install-paseo-lean.sh --ref v0.10.2
+```
+
+Then on `compute-1-2` (it detaches; no config change):
+
+```bash
+~/soft/paseo-slurm/scripts/restart-paseo-worker.sh
+```
+
+- The script (`51cb600`) validates config.json with the new installed
+  server, plans `restart`, sends the restart in the background, SIGKILLs
+  the old worker's tree if it is still alive after 30 s, confirms the new
+  pid plus `/api/health`, and runs both recovers. Its log is
+  `~/soft/paseo-rollback/restart-worker-<time>.log`.
+- Dry run at 20:42, read-only: supervisor 2684356, worker 2684370,
+  "installed server accepts the config", plan `restart`.
+- The config keeps `daemon.git.enabled=false`; the schema is unchanged.
+
+Impact: a few seconds of `npm i -g`, and one worker restart that
+interrupts every agent's current turn.
+
+After the restart, repeat `openInNewTab` on the ACS PDF URL from a new
+agent. Expect `ok` with `hashVerified`, or a clear error, with no tab left
+open (`browser_list_tabs`).
+
+Rollback: on kestrel,
+`npm i -g ~/soft/paseo-rollback/v0.10.2-git-switch-20261005/getpaseo-{highlight,protocol,plugin,relay,client,server,cli}-0.10.2.tgz`,
+then `restart-paseo-worker.sh` on `compute-1-2`. The config keys stay
+valid, since that build has the git switch.
