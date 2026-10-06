@@ -104,3 +104,18 @@ Added tests:
 - schema;
 - plus the earlier neighbouring, build, order and `--check-only` checks.
 
+## Amendment 2 - 2026-10-05
+
+The 18:39 deployment of `--disable-git` took Paseo down. The script wrote
+the new strict key before the restart, and the old worker then refused
+every connection, including the restart. The coordinator asked for:
+
+- a reordering, so that a key the running worker cannot parse is never
+  written while it lives, covering rollback too;
+- a restart that does not depend on the old worker's RPC, using the
+  supervisor's respawn after confirming it in code;
+- a test or dry-run of the ordering;
+- the incident recorded.
+
+Not run for real, because the deployment is in effect.
+

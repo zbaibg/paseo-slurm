@@ -338,6 +338,12 @@ Rollback:
    `npm i -g ~/soft/paseo-rollback/v0.10.2-browser-download-20261005/getpaseo-{highlight,protocol,plugin,relay,client,server,cli}-0.10.2.tgz`
 3. On `compute-1-2`: `~/soft/paseo-slurm/scripts/restart-paseo-worker.sh`
 
+Step 1 must come first. The patched worker and CLI accept the keys being
+absent, but the old CLI and worker reject them being present. Since `51cb600`
+the script validates config.json with the installed server before
+restarting. If step 1 was skipped, step 3 refuses and changes nothing; then
+run it with `--clear-git-keys`.
+
 ## Resource status
 
 - Development ran on `compute-1-2` node-local `/var/tmp`. The integrated
@@ -375,3 +381,110 @@ Rollback:
 - Housekeeping before the restart: 16 stale `watching` paseo-slurm groups cancelled with `paseo-slurm group cancel` (no scancel):
   the 15 listed in the browser-download record plus `6c6081cd-group-1787928183702` (agent "MS", archived, Slurm jobs of
   2026-08-28). Remaining watching groups: 93805cae-group-1791238234191, 70bf1e30-group-1791233464788.
+
+## Incident 2026-10-05 18:39–18:50 and fix (task agent)
+
+Timeline, from `~/soft/paseo-rollback/restart-worker-20261005-183917.log`
+and the coordinator's report:
+
+- **18:39:37** — the script wrote `daemon.git = {"enabled": false}` while
+  worker 2567403 was running. That worker had started at 17:35 from the
+  browser-download build, without this patch.
+- **18:39:38** — restart sent. At 18:39:50 the CLI exited 1: "Cannot
+  connect to daemon … Invalid hello".
+- **18:45:00** — "ERROR no healthy replacement worker after 300 s". No
+  restart had ever been requested, so the old worker kept running but
+  refused every client, and agents could not start.
+- **18:50** — the Human restarted Paseo. The new supervisor 2684356 and
+  worker 2684370 run the patched install, log "Daemon git integration is
+  disabled…", and are healthy.
+
+Mechanism:
+
+- Every client connection builds a `Session`, whose constructor calls
+  `loadPersistedConfig()` (`server/session.ts:1145`; the agent tool catalog
+  does the same at `bootstrap.ts:1424`).
+- The old build's strict schema throws `daemon.git: Unrecognized key:
+  "enabled"`. I reproduced that message with the rollback tarball's server
+  on the live config.
+- `handleHello` catches the error and closes the socket as "Invalid hello"
+  (`websocket-server.ts:1665`). The restart RPC is such a connection, so it
+  could not reach the worker.
+
+My design error:
+
+- I knew about the strict schema, but placed the write "seconds before the
+  restart". I assumed the old worker reads config.json only occasionally.
+  In fact it reads it on every connection, the restart request included.
+- The script had no path that did not depend on the old worker.
+
+Supervisor behaviour, from `packages/server/scripts/supervisor.ts`
+(`runSupervisor`, worker `exit` handler):
+
+- It spawns a new worker only after a restart request over IPC (sent by
+  the worker itself when it handles the restart RPC), or after a "crash":
+  `restartOnCrash` (true in `supervisor-entrypoint`) and exit code ≠ 0, or a
+  signal other than SIGTERM, provided the worker had reached ready.
+- A worker that exits 0 or dies from SIGTERM makes the supervisor exit.
+- SIGINT/SIGTERM to the supervisor shut everything down. It has no restart
+  signal.
+- Its own graceful restart force-kills the worker's process tree after
+  10 s (`WORKER_TERMINATION_GRACE_MS`).
+- `tests/supervisor-respawn-check.mjs` runs the installed `runSupervisor`
+  with a dummy worker. Result: SIGKILL of a ready worker → respawned
+  (2705818 → 2705830); SIGTERM of the new worker → the supervisor exited
+  (code 1).
+
+Fix (`51cb600`, `scripts/restart-paseo-worker.sh`):
+
+1. Build the edited config in a private temporary file and validate it with
+   the installed server's `loadPersistedConfig`. If rejected: no write, no
+   restart. This also guards the rollback direction.
+2. Plan the writes:
+   - `restart` if nothing changes;
+   - `write restart` for removals only, or when the running worker started
+     after the installed server's `persisted-config.js` was written (ctime);
+   - otherwise `restart write restart`: the second restart runs a worker
+     that already parses the key, so it starts with git off and sets up no
+     watchers.
+3. Restart: run the CLI in the background and poll for a new worker pid
+   plus `/api/health`. If the old worker is still alive after 30 s, SIGKILL
+   its process tree (the supervisor's own hard path) and wait up to 120 s
+   for the respawn.
+4. With `--disable-git` or ignored paths, require the new pid's startup log
+   line within 60 s.
+5. Then run `paseo-local recover` and `paseo-slurm recover`.
+
+New options: `--clear-git-keys` (rollback) and `--server-package DIR`.
+
+In the incident state (installed server patched, key present, old worker
+unpatched), the new script validates, plans `restart`, sees the RPC fail,
+SIGKILLs the old worker after 30 s, and the supervisor respawns the patched
+worker. From the pre-incident state it would have planned
+`restart write restart`.
+
+Tests (read-only for the live daemon; output in
+`tests/output/restart-ordering/`):
+
+- `tests/restart-ordering-dryrun.sh` runs five `--dry-run` cases with real
+  builds — installed, a fresh copy of it (an install newer than the
+  worker), and the pre-patch rollback build:
+  - `write restart` for a current worker;
+  - `restart write restart` for a stale worker;
+  - the old build rejects the live config, so no restart;
+  - the old build with `--clear-git-keys` gives `write restart`;
+  - the old build with `--disable-git` is rejected with `Unrecognized key:
+    "enabled"`.
+  config.json and worker 2684370 were unchanged afterwards: 7/7 PASS.
+- Forcing "write before restart" for every plan makes the stale-worker case
+  FAIL, so the harness detects the incident ordering.
+- `tests/supervisor-respawn-check.mjs`: 2/2 PASS (above).
+- Not run for real; the deployment is already in effect.
+
+Remaining caveats:
+
+- The `restart write restart` plan interrupts agents twice, and the first
+  new worker runs git briefly until the key lands (≤ 5 s reread).
+- The SIGKILL fallback ends agent and terminal processes abruptly, as the
+  supervisor's own force path does.
+

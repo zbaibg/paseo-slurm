@@ -130,3 +130,33 @@ execCommand git --version -> Paseo daemon git integration is disabled (...); not
 - `--disable-git --reset-git-throttle`: refused, "git-ignored-paths.js lacks
   PASEO_GIT_DISABLED (workspace-git-ignore patch); install first, config left
   unchanged".
+
+## Amendment 2: restart ordering and fallback
+
+Mechanism reproduced (rollback build, live config):
+
+```text
+installed (patched) server, live config         config accepted
+rollback (pre-patch) server, live config        [Config] Invalid config ... daemon.git: Unrecognized key: "enabled"
+rollback server, enabled/ignoredPaths removed   config accepted
+```
+
+`tests/restart-ordering-dryrun.sh` (after `51cb600`):
+
+```text
+PASS current-worker-adds-key: plan: write restart
+PASS stale-worker-adds-key: plan: restart write restart
+PASS old-server-rejects-current-config: ERROR config.json unchanged and no restart
+PASS old-server-clear-git-keys: plan: write restart
+PASS old-server-rejects-disable-git: Unrecognized key: "enabled"
+PASS config.json unchanged
+PASS worker 2684370 unchanged
+mutation (always write first): FAIL stale-worker-adds-key, failures=1
+```
+
+`tests/supervisor-respawn-check.mjs` (installed supervisor.js, dummy worker):
+
+```text
+PASS SIGKILL of a ready worker respawns it (2705818 -> 2705830)
+PASS SIGTERM of the worker makes the supervisor exit ({"code":1,"signal":null})
+```

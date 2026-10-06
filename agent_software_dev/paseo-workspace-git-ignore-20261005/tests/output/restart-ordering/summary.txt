@@ -1,0 +1,8 @@
+PASS current-worker-adds-key: plan: write restart
+PASS stale-worker-adds-key: plan: restart write restart
+PASS old-server-rejects-current-config: ERROR config.json unchanged and no restart
+PASS old-server-clear-git-keys: plan: write restart
+PASS old-server-rejects-disable-git: Unrecognized key: "enabled"
+PASS config.json unchanged
+PASS worker 2684370 unchanged
+failures=0
