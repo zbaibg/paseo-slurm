@@ -209,6 +209,7 @@ hits = {
     "codex_rewind_mcp": False,
     "opus_1m": False,
     "browser_download": False,
+    "browser_download_new_tab": False,
     "git_ignored_paths": False,
     "git_disable": False,
 }
@@ -227,6 +228,9 @@ for dirpath, dirnames, filenames in os.walk(root):
     if "paseo-tools.js" in filenames and dirpath.replace("\\", "/").endswith("/agent/tools"):
         text = open(os.path.join(dirpath, "paseo-tools.js"), encoding="utf-8").read()
         hits["browser_download"] = "registerBrowserDownloadTool" in text
+    if "download.js" in filenames and dirpath.replace("\\", "/").endswith("/browser-tools"):
+        text = open(os.path.join(dirpath, "download.js"), encoding="utf-8").read()
+        hits["browser_download_new_tab"] = "registrationTimeoutBrowserId" in text
     if "run-git-command.js" in filenames and dirpath.replace("\\", "/").endswith("/dist/server/utils"):
         text = open(os.path.join(dirpath, "run-git-command.js"), encoding="utf-8").read()
         hits["git_ignored_paths"] = "isGitIgnoredPath" in text

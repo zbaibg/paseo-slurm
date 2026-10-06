@@ -90,10 +90,10 @@ index 07f9f21..2de68a3 100644
 +}
 diff --git a/packages/server/src/server/browser-tools/download.test.ts b/packages/server/src/server/browser-tools/download.test.ts
 new file mode 100644
-index 0000000..1bb00c6
+index 0000000..fa5a8a2
 --- /dev/null
 +++ b/packages/server/src/server/browser-tools/download.test.ts
-@@ -0,0 +1,562 @@
+@@ -0,0 +1,671 @@
 +import { createHash } from "node:crypto";
 +import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 +import { tmpdir } from "node:os";
@@ -135,7 +135,12 @@ index 0000000..1bb00c6
 +interface FakePage {
 +  href: string;
 +  window: Record<string, unknown>;
++  readyState?: string;
 +}
++
++// How a new tab registers with the desktop automation host. The real app waits 5 s, then
++// answers browser_timeout naming the tab, which stays open and may register later.
++type FakeRegistration = "immediate" | "never" | { afterListCalls: number };
 +
 +class FakeDownloadBroker {
 +  public readonly calls: BrowserToolsExecuteInput[] = [];
@@ -147,6 +152,12 @@ index 0000000..1bb00c6
 +  public onChunkResult: ((resultJson: string, chunkIndex: number) => string) | null = null;
 +  public beforeChunk: ((page: FakePage, chunkIndex: number) => void) | null = null;
 +  public beforeStatus: ((page: FakePage) => void) | null = null;
++  public newTabRegistration: FakeRegistration = "immediate";
++  public timeoutMessageNamesTab = true;
++  public newTabReadyState = "complete";
++  public readonly closedTabs: string[] = [];
++  private readonly registered = new Set<string>([ARTICLE_TAB]);
++  private listCallsSinceNewTab = 0;
 +  private chunkReads = 0;
 +
 +  public constructor(private readonly resources: Map<string, FakeResource>) {
@@ -161,22 +172,17 @@ index 0000000..1bb00c6
 +    }
 +    const command = input.command;
 +    if (command.command === "new_tab") {
-+      this.pages.set(NEW_TAB, { href: "about:blank", window: {} });
-+      return {
-+        requestId,
-+        ok: true,
-+        result: {
-+          command: "new_tab",
-+          browserId: NEW_TAB,
-+          workspaceId: "wks_a",
-+          url: "about:blank",
-+        },
-+      };
++      return this.newTab(requestId, command.args.url);
 +    }
 +    if (command.command === "list_tabs") {
-+      return { requestId, ok: true, result: { command: "list_tabs", tabs: [] } };
++      return this.listTabs(requestId);
 +    }
-+    const page = this.pages.get(command.args.browserId);
++    if (command.command === "close_tab") {
++      return this.closeTab(requestId, command.args.browserId);
++    }
++    const page = this.registered.has(command.args.browserId)
++      ? this.pages.get(command.args.browserId)
++      : undefined;
 +    if (!page) {
 +      return fail(requestId, "browser_tab_not_found", `No browser tab ${command.args.browserId}`);
 +    }
@@ -187,14 +193,6 @@ index 0000000..1bb00c6
 +        requestId,
 +        ok: true,
 +        result: { command: "navigate", browserId: command.args.browserId, url: command.args.url },
-+      };
-+    }
-+    if (command.command === "close_tab") {
-+      this.pages.delete(command.args.browserId);
-+      return {
-+        requestId,
-+        ok: true,
-+        result: { command: "close_tab", browserId: command.args.browserId },
 +      };
 +    }
 +    if (command.command !== "evaluate") {
@@ -225,6 +223,58 @@ index 0000000..1bb00c6
 +        truncated,
 +      },
 +    };
++  }
++
++  private newTab(requestId: string, target: string | undefined): BrowserToolsResponsePayload {
++    const url = target ?? "https://example.com";
++    const href = this.resources.get(url)?.finalUrl ?? url;
++    this.pages.set(NEW_TAB, { href, window: {}, readyState: this.newTabReadyState });
++    this.listCallsSinceNewTab = 0;
++    if (this.newTabRegistration === "immediate") {
++      this.registered.add(NEW_TAB);
++      return {
++        requestId,
++        ok: true,
++        result: { command: "new_tab", browserId: NEW_TAB, workspaceId: "wks_a", url },
++      };
++    }
++    const named = this.timeoutMessageNamesTab ? `browser tab ${NEW_TAB}` : "the new browser tab";
++    return fail(
++      requestId,
++      "browser_timeout",
++      `Timed out waiting for ${named} to register with the browser automation host. Try browser_new_tab again.`,
++      true,
++    );
++  }
++
++  private listTabs(requestId: string): BrowserToolsResponsePayload {
++    this.listCallsSinceNewTab += 1;
++    const registration = this.newTabRegistration;
++    if (
++      this.pages.has(NEW_TAB) &&
++      typeof registration === "object" &&
++      this.listCallsSinceNewTab >= registration.afterListCalls
++    ) {
++      this.registered.add(NEW_TAB);
++    }
++    const tabs = [...this.registered]
++      .filter((id) => this.pages.has(id))
++      .map((id) => ({
++        browserId: id,
++        url: this.pages.get(id)!.href,
++        title: "",
++        isActive: false,
++        isLoading: false,
++      }));
++    return { requestId, ok: true, result: { command: "list_tabs", tabs } };
++  }
++
++  // The app closes a tab from its own stores, registered with the host or not.
++  private closeTab(requestId: string, browserId: string): BrowserToolsResponsePayload {
++    this.closedTabs.push(browserId);
++    this.pages.delete(browserId);
++    this.registered.delete(browserId);
++    return { requestId, ok: true, result: { command: "close_tab", browserId } };
 +  }
 +
 +  public chunkReadCount(): number {
@@ -259,9 +309,11 @@ index 0000000..1bb00c6
 +      "fetch",
 +      "crypto",
 +      "globalThis",
++      "document",
 +      `return (${source});`,
 +    ) as (...args: unknown[]) => () => unknown;
-+    const fn = build(page.window, { href: page.href }, fakeFetch, pageCrypto, pageGlobal);
++    const document = { readyState: page.readyState ?? "complete" };
++    const fn = build(page.window, { href: page.href }, fakeFetch, pageCrypto, pageGlobal, document);
 +    return Promise.resolve(fn());
 +  }
 +}
@@ -281,6 +333,7 @@ index 0000000..1bb00c6
 +    resources: Map<string, FakeResource>;
 +    chunkBytes?: number;
 +    workspaceId?: string;
++    tabRegistrationWaitMs?: number;
 +  }) {
 +    this.broker = new FakeDownloadBroker(params.resources);
 +    this.settings = { enabled: true, allowedRoots: null, maxBytes: 200 * 1024 * 1024 };
@@ -299,6 +352,7 @@ index 0000000..1bb00c6
 +      }),
 +      readSettings: () => this.settings,
 +      pollIntervalMs: 1,
++      tabRegistrationWaitMs: params.tabRegistrationWaitMs ?? 200,
 +      ...(params.chunkBytes ? { chunkBytes: params.chunkBytes } : {}),
 +    });
 +    if (!registered) {
@@ -526,6 +580,61 @@ index 0000000..1bb00c6
 +      command: "close_tab",
 +      args: { browserId: NEW_TAB },
 +    });
++    const commands = h.broker.calls.map((call) => call.command);
++    expect(commands).toContainEqual({ command: "new_tab", args: { url: CDN_LINK } });
++    expect(commands.some((command) => command.command === "navigate")).toBe(false);
++  });
++
++  test("a new tab that registers after the desktop's own wait is used, then closed", async () => {
++    const h = harness();
++    h.broker.newTabRegistration = { afterListCalls: 3 };
++
++    const { structured } = await h.run({ url: CDN_LINK, openInNewTab: true, path: "late.pdf" });
++
++    expect(structured).toMatchObject({ ok: true, browserId: NEW_TAB, finalUrl: CDN_URL });
++    expect(h.broker.closedTabs).toEqual([NEW_TAB]);
++    expect(h.broker.pages.has(NEW_TAB)).toBe(false);
++  });
++
++  test("tab registration timeout: the tab is closed and nothing is written", async () => {
++    const h = harness({ tabRegistrationWaitMs: 50 });
++    h.broker.newTabRegistration = "never";
++
++    const { structured, text } = await h.run({ url: CDN_LINK, openInNewTab: true, path: "x.pdf" });
++
++    expect(errorCode(structured)).toBe("browser_timeout");
++    expect(text).toContain(`${NEW_TAB} did not register`);
++    expect(h.broker.closedTabs).toEqual([NEW_TAB]);
++    expect(h.broker.pages.has(NEW_TAB)).toBe(false);
++    expect(await readdir(cwd)).toEqual([]);
++  });
++
++  test("a registration timeout that does not name the tab closes the new tab from the list", async () => {
++    const h = harness();
++    h.broker.newTabRegistration = { afterListCalls: 2 };
++    h.broker.timeoutMessageNamesTab = false;
++
++    const { structured } = await h.run({ url: CDN_LINK, openInNewTab: true, path: "x.pdf" });
++
++    expect(errorCode(structured)).toBe("browser_timeout");
++    expect(h.broker.closedTabs).toEqual([NEW_TAB]);
++  });
++
++  test("a new tab that never finishes loading is closed", async () => {
++    const h = harness();
++    h.broker.newTabReadyState = "loading";
++
++    const { structured, text } = await h.run({
++      url: CDN_LINK,
++      openInNewTab: true,
++      path: "x.pdf",
++      timeoutMs: 50,
++    });
++
++    expect(errorCode(structured)).toBe("download_timeout");
++    expect(text).toContain("did not finish loading");
++    expect(h.broker.closedTabs).toEqual([NEW_TAB]);
++    expect(await readdir(cwd)).toEqual([]);
 +  });
 +
 +  test("non-200 responses, magic mismatch and the size cap return their codes", async () => {
@@ -658,10 +767,10 @@ index 0000000..1bb00c6
 +});
 diff --git a/packages/server/src/server/browser-tools/download.ts b/packages/server/src/server/browser-tools/download.ts
 new file mode 100644
-index 0000000..4f9826a
+index 0000000..8312d5b
 --- /dev/null
 +++ b/packages/server/src/server/browser-tools/download.ts
-@@ -0,0 +1,956 @@
+@@ -0,0 +1,1080 @@
 +import { createHash, randomUUID } from "node:crypto";
 +import { link, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 +import { basename, dirname, isAbsolute, join } from "node:path";
@@ -686,12 +795,18 @@ index 0000000..4f9826a
 +const BROWSER_DOWNLOAD_CHUNK_CONCURRENCY = 4;
 +const BROWSER_DOWNLOAD_POLL_INTERVAL_MS = 250;
 +const BROWSER_DOWNLOAD_COMMAND_TIMEOUT_MS = 30_000;
++// The desktop app gives up on a new tab after 5 s of waiting for it to register with its
++// automation host (app handler waitForBrowserRegistration) but leaves the tab open. The daemon
++// keeps waiting for it this long before closing it.
++const BROWSER_DOWNLOAD_TAB_REGISTRATION_WAIT_MS = 60_000;
++const NEW_TAB_REGISTRATION_TIMEOUT_PATTERN = /browser tab (\S+) to register/;
 +const BROWSER_DOWNLOAD_HEAD_BYTES = 16;
 +const BROWSER_DOWNLOAD_TEXT_FIELD_LIMIT = 500;
 +
 +export type BrowserDownloadErrorCode =
 +  | "browser_disabled"
 +  | "browser_denied"
++  | "browser_timeout"
 +  | "download_invalid_input"
 +  | "download_config_invalid"
 +  | "download_destination_denied"
@@ -738,6 +853,7 @@ index 0000000..4f9826a
 +  readSettings: () => BrowserDownloadSettings;
 +  chunkBytes?: number;
 +  pollIntervalMs?: number;
++  tabRegistrationWaitMs?: number;
 +}
 +
 +interface BrowserDownloadContext {
@@ -912,7 +1028,6 @@ index 0000000..4f9826a
 +
 +  const session = new BrowserDownloadSession(options, context);
 +  let browserId = input.browserId;
-+  let openedTab = false;
 +  try {
 +    if (input.openInNewTab) {
 +      if (!context.workspaceId) {
@@ -926,7 +1041,6 @@ index 0000000..4f9826a
 +        return opened;
 +      }
 +      browserId = opened.browserId;
-+      openedTab = true;
 +    }
 +    const tabId = browserId as string;
 +    const fetchUrl = input.openInNewTab ? null : (input.url ?? null);
@@ -964,9 +1078,8 @@ index 0000000..4f9826a
 +      browserId: tabId,
 +    };
 +  } finally {
-+    if (openedTab && browserId) {
-+      await session.closeTab(browserId);
-+    }
++    // Every tab this call created, including one whose registration timed out, is closed.
++    await session.closeOpenedTabs();
 +  }
 +}
 +
@@ -994,6 +1107,8 @@ index 0000000..4f9826a
 +}
 +
 +class BrowserDownloadSession {
++  private readonly openedTabs = new Set<string>();
++
 +  public constructor(
 +    private readonly options: RegisterBrowserDownloadToolOptions,
 +    private readonly context: BrowserDownloadContext,
@@ -1003,27 +1118,133 @@ index 0000000..4f9826a
 +    url: string,
 +    timeoutMs: number,
 +  ): Promise<{ ok: true; browserId: string } | BrowserDownloadFailure> {
-+    const created = await this.execute({ command: "new_tab", args: {} });
-+    if (!created.ok) {
-+      return brokerFailure(created);
++    const before = await this.listTabs();
++    // Open on the target directly: without a URL the desktop app opens https://example.com.
++    const created = await this.execute({ command: "new_tab", args: { url } });
++    let browserId: string;
++    if (created.ok) {
++      if (created.result.command !== "new_tab") {
++        return failure("download_page_error", "browser_new_tab returned an unexpected result.");
++      }
++      browserId = created.result.browserId;
++      this.openedTabs.add(browserId);
++    } else {
++      const pending = registrationTimeoutBrowserId(created);
++      if (!pending) {
++        if (created.error.code === "browser_timeout") {
++          await this.adoptNewTabs(before, url);
++        }
++        return brokerFailure(created);
++      }
++      this.openedTabs.add(pending);
++      const waitMs =
++        this.options.tabRegistrationWaitMs ?? BROWSER_DOWNLOAD_TAB_REGISTRATION_WAIT_MS;
++      if (!(await this.waitForListedTab(pending, waitMs))) {
++        return failure(
++          "browser_timeout",
++          `The new browser tab ${pending} did not register with the browser host within ${Math.round(waitMs / 1000)} s; it is being closed.`,
++          true,
++        );
++      }
++      browserId = pending;
 +    }
-+    if (created.result.command !== "new_tab") {
-+      return failure("download_page_error", "browser_new_tab returned an unexpected result.");
-+    }
-+    const browserId = created.result.browserId;
-+    const navigated = await this.execute(
-+      { command: "navigate", args: { browserId, url } },
-+      timeoutMs,
-+    );
-+    if (!navigated.ok) {
-+      await this.closeTab(browserId);
-+      return brokerFailure(navigated);
-+    }
-+    return { ok: true, browserId };
++    const loaded = await this.waitForTabLoad(browserId, timeoutMs);
++    return loaded.ok ? { ok: true, browserId } : loaded;
 +  }
 +
-+  public async closeTab(browserId: string): Promise<void> {
-+    await this.execute({ command: "close_tab", args: { browserId } }).catch(() => undefined);
++  public async closeOpenedTabs(): Promise<void> {
++    for (const browserId of this.openedTabs) {
++      await this.execute({ command: "close_tab", args: { browserId } }).catch(() => undefined);
++    }
++    this.openedTabs.clear();
++  }
++
++  private async listTabs(): Promise<Array<{ browserId: string; url: string }> | null> {
++    const listed = await this.execute({ command: "list_tabs", args: {} });
++    if (!listed.ok || listed.result.command !== "list_tabs") {
++      return null;
++    }
++    return listed.result.tabs.map((tab) => ({ browserId: tab.browserId, url: tab.url }));
++  }
++
++  private async waitForListedTab(browserId: string, waitMs: number): Promise<boolean> {
++    const deadline = Date.now() + waitMs;
++    for (;;) {
++      const tabs = await this.listTabs();
++      if (tabs?.some((tab) => tab.browserId === browserId)) {
++        return true;
++      }
++      if (Date.now() >= deadline) {
++        return false;
++      }
++      await delay(this.pollIntervalMs());
++    }
++  }
++
++  // Fallback when a registration timeout does not name the tab. A tab that appears during the
++  // registration wait is taken as this call's if it is on the target URL, or if it is the only
++  // new tab (after a redirect its URL differs); several unrelated new tabs are left alone.
++  private async adoptNewTabs(
++    before: Array<{ browserId: string }> | null,
++    url: string,
++  ): Promise<void> {
++    if (!before) {
++      return;
++    }
++    const known = new Set(before.map((tab) => tab.browserId));
++    const deadline =
++      Date.now() +
++      (this.options.tabRegistrationWaitMs ?? BROWSER_DOWNLOAD_TAB_REGISTRATION_WAIT_MS);
++    for (;;) {
++      const fresh = ((await this.listTabs()) ?? []).filter((tab) => !known.has(tab.browserId));
++      const onTarget = fresh.filter((tab) => tab.url.startsWith(url));
++      let adopted = onTarget;
++      if (adopted.length === 0 && fresh.length === 1) {
++        adopted = fresh;
++      }
++      if (adopted.length > 0) {
++        for (const tab of adopted) this.openedTabs.add(tab.browserId);
++        return;
++      }
++      if (Date.now() >= deadline) {
++        return;
++      }
++      await delay(this.pollIntervalMs());
++    }
++  }
++
++  private async waitForTabLoad(
++    browserId: string,
++    timeoutMs: number,
++  ): Promise<{ ok: true } | BrowserDownloadFailure> {
++    const deadline = Date.now() + timeoutMs;
++    let lastError = "";
++    for (;;) {
++      const state = await this.evaluate(
++        browserId,
++        "() => ({ href: location.href, readyState: document.readyState })",
++      );
++      if (state.ok) {
++        const page = state.value as { href?: string; readyState?: string } | null;
++        if (page?.readyState === "complete" && /^https?:/i.test(page.href ?? "")) {
++          return { ok: true };
++        }
++      } else {
++        lastError = state.error.message;
++      }
++      if (Date.now() >= deadline) {
++        return failure(
++          "download_timeout",
++          `The new tab did not finish loading within ${timeoutMs}ms${lastError ? ` (${limitText(lastError)})` : ""}.`,
++          true,
++        );
++      }
++      await delay(this.pollIntervalMs());
++    }
++  }
++
++  private pollIntervalMs(): number {
++    return this.options.pollIntervalMs ?? BROWSER_DOWNLOAD_POLL_INTERVAL_MS;
 +  }
 +
 +  public async transfer(params: {
@@ -1533,6 +1754,18 @@ index 0000000..4f9826a
 +  retryable = false,
 +): BrowserDownloadFailure {
 +  return { ok: false, error: { code, message, retryable } };
++}
++
++function registrationTimeoutBrowserId(
++  payload: Extract<BrowserToolsResponsePayload, { ok: false }>,
++): string | null {
++  if (payload.error.code !== "browser_timeout") {
++    return null;
++  }
++  const candidate = NEW_TAB_REGISTRATION_TIMEOUT_PATTERN.exec(payload.error.message)?.[1];
++  return candidate && BrowserAutomationBrowserIdSchema.safeParse(candidate).success
++    ? candidate
++    : null;
 +}
 +
 +function brokerFailure(payload: Extract<BrowserToolsResponsePayload, { ok: false }>) {

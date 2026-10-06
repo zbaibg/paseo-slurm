@@ -123,6 +123,7 @@ Global `@getpaseo/server` dist must contain:
 - `getExternalWaitIdFromLabels` in `agent-prompt.js`
 - `claudeLaunchModelId` in `providers/claude/model-manifest.js`
 - `registerBrowserDownloadTool` in `agent/tools/paseo-tools.js`
+- `registrationTimeoutBrowserId` in `browser-tools/download.js`
 - `isGitIgnoredPath` in `utils/run-git-command.js`
 - `PASEO_GIT_DISABLED` in `utils/git-ignored-paths.js`
 - `config: input.config` in `providers/codex/rewind.js` (official #5345, not a local patch)

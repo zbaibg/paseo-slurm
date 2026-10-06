@@ -58,7 +58,13 @@ sbatch ./scripts/paseo-compute.sbatch
    SHA-256 checks (temporary file, then `rename`, or `link` when overwrite is
    off). The model only sees path, bytes, SHA-256, content type, final URL
    and the magic check. `openInNewTab` handles links that redirect to a signed
-   cross-origin CDN URL. The desktop client caps an evaluate result at 80,000
+   cross-origin CDN URL. It opens the target URL directly with `new_tab`;
+   without a URL the desktop app would open `https://example.com`. The
+   desktop app stops waiting for a new tab to register after 5 s and answers
+   `browser_timeout`, naming the tab and leaving it open. The tool keeps
+   polling `list_tabs` for up to 60 s and waits for `document.readyState`
+   to be complete. It closes every tab it opened, on success and on every
+   failure path, including a tab that never registered. The desktop client caps an evaluate result at 80,000
    JSON characters, which is why chunks are 57,000 bytes (76,002 characters).
 
    Optional config in `~/.paseo/config.json`, read on every call:
