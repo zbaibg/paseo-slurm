@@ -56,6 +56,20 @@ confirmation polls `daemon.get_status` with a 1 s timeout, and that request
 awaits every provider's availability probe (about 2 s here), so the CLI can
 poll until its 600 s default timeout.
 
+- **Unresponsive old worker.** If the old worker is still alive 30 s after
+  the request, the script SIGKILLs its process tree. The supervisor respawns
+  a worker that exits with a non-zero code or a signal other than SIGTERM;
+  it exits on a worker SIGTERM or on any signal to itself.
+- **Config edits** (`--disable-git`, `--set-git-ignored-paths`,
+  `--reset-git-throttle`, `--clear-git-keys`) are validated with the
+  installed server's own loader first. A key is never written while a worker
+  that rejects it is running: every worker re-reads config.json strictly for
+  each new connection and refuses all clients otherwise. If the running
+  worker predates the install, the script restarts, writes, then restarts
+  again. `tests/restart-ordering-dryrun.sh` in
+  `agent_software_dev/paseo-workspace-git-ignore-20261005/` checks these
+  plans read-only.
+
 ## What the installer does
 
 1. Resolve stable ref: `v$(npm view @getpaseo/cli version)` (or `--ref`).

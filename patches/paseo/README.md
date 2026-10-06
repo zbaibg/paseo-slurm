@@ -106,10 +106,14 @@ sbatch ./scripts/paseo-compute.sbatch
    spawns without a restart; watchers set up before the change stop only at
    the next worker restart, and turning git back on takes full effect after
    a restart. `daemon.git` is a strict schema: an unpatched daemon or CLI
-   rejects a `config.json` that contains `enabled` or `ignoredPaths`, so
-   write them only after installing this patch and remove them before
-   rolling back. `scripts/restart-paseo-worker.sh --disable-git` (or
-   `--set-git-ignored-paths`) does both steps in that order.
+   rejects a `config.json` that contains `enabled` or `ignoredPaths`. A
+   running unpatched worker then refuses every connection ("Invalid hello");
+   this took Paseo down on 2026-10-05. Never write these keys while such a
+   worker runs. `scripts/restart-paseo-worker.sh --disable-git` (or
+   `--set-git-ignored-paths`) validates with the installed server and
+   restarts before writing when the running worker predates the install.
+   After rolling back to a build without this patch, use
+   `restart-paseo-worker.sh --clear-git-keys`.
 
 Paseo does not poll Slurm or interpret the wait id. That policy stays in
 `paseo-slurm`.
