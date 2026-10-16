@@ -12,7 +12,7 @@ until upstream lands the same behavior.
 | Workspace git ignore / off | `workspace-git-ignore.patch` (`daemon.git.enabled: false` or `daemon.git.ignoredPaths`: no daemon git, forge CLI or watcher work, everywhere or in those workspaces) |
 | Upstream discussion | https://github.com/getpaseo/paseo/discussions/3010 |
 | Upstream draft PR | https://github.com/getpaseo/paseo/pull/3011 (closed unmerged) |
-| Verified against | `getpaseo/paseo` `v0.10.2` (`919c737c1`) |
+| Verified against | `getpaseo/paseo` `v0.11.4` (`dc5b02f7d`) |
 | Install | [install-and-patch.md](./install-and-patch.md) — lean CLI/daemon from latest stable |
 
 Do not vendor a resume-MCP rebind for [getpaseo/paseo#3283](https://github.com/getpaseo/paseo/issues/3283): after daemon restart the thread is unloaded, so Paseo already sends the runtime overlay on `thread/resume`. Codex 0.148 honors that. Rewind/`thread/fork` is official since [getpaseo/paseo#5345](https://github.com/getpaseo/paseo/pull/5345) (closes [#3205](https://github.com/getpaseo/paseo/issues/3205)).
@@ -42,7 +42,7 @@ sbatch ./scripts/paseo-compute.sbatch
    resume attempts fail on stock stable CLI.
 3. When `ANTHROPIC_BASE_URL` is a gateway rather than `api.anthropic.com`, send
    bare catalog ids whose window is already 1M — Opus 5, Opus 5.5, Fable 5,
-   Fable 5.1, and Sonnet 5.5 — as `${id}[1m]`. Claude Code otherwise budgets
+   Fable 5.1, Sonnet 5.5, and Haiku 5.5 — as `${id}[1m]`. Claude Code otherwise budgets
    those bare ids at 200k. The catalog id and the picker stay unchanged. Rows
    that are their own 200k or 1M entries, such as Sonnet 5 and Opus 4.8, are
    left unchanged. With the base URL unset or pointed at the official API, the
@@ -97,8 +97,10 @@ sbatch ./scripts/paseo-compute.sbatch
 
    `daemon.git.enabled: false` (default true) or `PASEO_GIT_DISABLED=1`
    (1/true/yes/on; overrides the config) treats every path as ignored, and
-   `utils/spawn.ts` then refuses to start `git`, `gh`, `glab` or `tea` for
-   any caller, so diagnostics and forge host probes start nothing either.
+   the server `utils/spawn.ts` wrapper then refuses to start `git`, `gh`,
+   `glab` or `tea` for any caller, so diagnostics and forge host probes start
+   nothing either. On v0.11.4 that wrapper delegates to the plugin process
+   launcher; the refusal stays in the wrapper.
    The worker logs one line at startup and one on each change ("Daemon git
    integration is disabled: …"). With git off, branch/diff/PR panels,
    Paseo worktree creation and git-sourced plugins are unavailable; plugin

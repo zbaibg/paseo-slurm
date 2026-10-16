@@ -1,28 +1,19 @@
-From local/paseo-v0.10.2-companion Mon Sep 29 00:00:00 2001
 From: zbai29 <zbai29@wisc.edu>
-Date: Tue, 29 Sep 2026 00:00:00 +0000
-Subject: [PATCH] Launch bare 1M Claude models with the gateway suffix
+Date: Thu, 15 Oct 2026 20:00:00 +0000
+Subject: [PATCH] Launch bare 1M Claude catalog ids with [1m] on a gateway
 
-Claude Code budgets a bare model id at 200k when ANTHROPIC_BASE_URL is not the
-official API. Catalog ids whose window is already 1M, and whose [1m] form is
-not a separate row, are sent with that suffix. The catalog id stays unchanged.
-Sonnet 5.5 is included; Sonnet 5 and Opus 4.8 keep their own rows.
+Claude Code budgets a bare catalog id at 200k when ANTHROPIC_BASE_URL is not
+the official API. Append [1m] only for a gateway, and only when that bare id
+already has a 1M window and is not its own distinct [1m] catalog row.
 
-With the base URL unset or set to api.anthropic.com, the id sent to Claude
-matches stock Paseo.
+Rebased onto getpaseo/paseo v0.11.4 (dc5b02f7d). Includes Haiku 5.5.
 
-Settings fallback uses the v0.10.2 config directory (claudeConfigDir), because
-resolveClaudeConfigDir was removed from models.ts.
-
-Applies to getpaseo/paseo v0.10.2 (919c737c1).
-
-Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
 diff --git a/packages/server/src/server/agent/providers/claude/agent.ts b/packages/server/src/server/agent/providers/claude/agent.ts
-index 04fef2b1f..6f94c0ebd 100644
+index b797ce2c9..0dbcb6618 100644
 --- a/packages/server/src/server/agent/providers/claude/agent.ts
 +++ b/packages/server/src/server/agent/providers/claude/agent.ts
-@@ -33,11 +33,13 @@ import {
+@@ -34,11 +34,13 @@ import {
    findClaudeModel,
    getClaudeModelsWithSettings,
    normalizeClaudeRuntimeModelId,
@@ -36,7 +27,7 @@ index 04fef2b1f..6f94c0ebd 100644
    parseClaudeCodeVersion,
    resolveClaudeDisabledThinkingForModel,
  } from "./model-manifest.js";
-@@ -2437,8 +2439,10 @@ class ClaudeAgentSession implements AgentSession {
+@@ -2496,8 +2498,10 @@ class ClaudeAgentSession implements AgentSession {
    async setModel(modelId: string | null): Promise<void> {
      const normalizedModelId =
        typeof modelId === "string" && modelId.trim().length > 0 ? modelId.trim() : null;
@@ -48,7 +39,7 @@ index 04fef2b1f..6f94c0ebd 100644
      this.config.model = normalizedModelId ?? undefined;
      this.reconcileThinkingOptionForModel(normalizedModelId);
      if (!claudeModelSupportsFastMode(this.config.model) && this.config.featureValues?.fast_mode) {
-@@ -3260,6 +3264,16 @@ class ClaudeAgentSession implements AgentSession {
+@@ -3345,6 +3349,16 @@ class ClaudeAgentSession implements AgentSession {
      });
    }
  
@@ -62,10 +53,10 @@ index 04fef2b1f..6f94c0ebd 100644
 +    return readClaudeSettingsAnthropicBaseUrl(claudeConfigDir(env));
 +  }
 +
-   private async buildOptions(): Promise<ClaudeOptions> {
+   private async buildOptions(permissionMode: PermissionMode): Promise<ClaudeOptions> {
      const { thinking, effort, ultracode } = this.resolveThinkingConfig();
      const appendedSystemPrompt = this.buildAppendedSystemPrompt();
-@@ -3332,10 +3346,11 @@ class ClaudeAgentSession implements AgentSession {
+@@ -3421,10 +3435,11 @@ class ClaudeAgentSession implements AgentSession {
        base.mcpServers = this.normalizeMcpServers(this.config.mcpServers);
      }
  
@@ -80,7 +71,7 @@ index 04fef2b1f..6f94c0ebd 100644
        base.resume = this.claudeSessionId;
      }
 diff --git a/packages/server/src/server/agent/providers/claude/model-manifest.ts b/packages/server/src/server/agent/providers/claude/model-manifest.ts
-index e2e64f28f..5a97ac1bc 100644
+index 398fcb1cc..3bfd27815 100644
 --- a/packages/server/src/server/agent/providers/claude/model-manifest.ts
 +++ b/packages/server/src/server/agent/providers/claude/model-manifest.ts
 @@ -34,6 +34,10 @@ export const CLAUDE_DEFAULT_THINKING_OPTION_ID = "high";
@@ -94,7 +85,7 @@ index e2e64f28f..5a97ac1bc 100644
  export const CLAUDE_MODEL_MANIFEST = [
    {
      id: "claude-opus-5-5",
-@@ -321,6 +325,51 @@ export function isClaudeManifestModelId(modelId: string): boolean {
+@@ -331,6 +335,51 @@ export function isClaudeManifestModelId(modelId: string): boolean {
    return CLAUDE_MODEL_MANIFEST.some((model) => model.id === modelId);
  }
  
@@ -147,7 +138,7 @@ index e2e64f28f..5a97ac1bc 100644
    const normalizedModelId = normalizeClaudeManifestModelId(modelId);
    if (!normalizedModelId) {
 diff --git a/packages/server/src/server/agent/providers/claude/models.test.ts b/packages/server/src/server/agent/providers/claude/models.test.ts
-index 0e187734b..05051acba 100644
+index ed7db8841..e4fee027d 100644
 --- a/packages/server/src/server/agent/providers/claude/models.test.ts
 +++ b/packages/server/src/server/agent/providers/claude/models.test.ts
 @@ -8,12 +8,19 @@ import { ClaudeAgentClient } from "./agent.js";
@@ -171,7 +162,7 @@ index 0e187734b..05051acba 100644
  
  const createdClaudeConfigDirs: string[] = [];
  
-@@ -610,6 +617,43 @@ describe("Claude Opus 5.5 catalog", () => {
+@@ -620,6 +627,44 @@ describe("Claude Opus 5.5 catalog", () => {
      ).toEqual(["medium"]);
    });
  
@@ -189,6 +180,7 @@ index 0e187734b..05051acba 100644
 +      "claude-fable-5",
 +      "claude-fable-5-1",
 +      "claude-sonnet-5-5",
++      "claude-haiku-5-5",
 +    ]) {
 +      expect(claudeLaunchModelId(modelId, gateway)).toBe(`${modelId}[1m]`);
 +      expect(claudeLaunchModelId(modelId)).toBe(modelId);
