@@ -114,7 +114,7 @@ for an unpatched registry install).
 
 ```bash
 which paseo          # should be ~/.nvm/versions/node/.../bin/paseo
-paseo --version      # e.g. 0.11.4 (stable, not *-beta.*)
+paseo --version      # e.g. 0.12.0 (stable, not *-beta.*)
 paseo send --help    # must list --system
 ```
 

@@ -1,5 +1,5 @@
 From: zbai29 <zbai29@wisc.edu>
-Date: Thu, 15 Oct 2026 20:00:00 +0000
+Date: Tue, 20 Oct 2026 15:00:00 +0000
 Subject: [PATCH] External-wait finish deferral and hidden system send
 
 Keep the original caller subscription alive across externally resumed work,
@@ -8,19 +8,20 @@ hidden <paseo-system> path instead of a user-message bubble.
 
 Does not include machine-local TMPDIR defaults.
 
-Rebased onto getpaseo/paseo v0.11.4 (dc5b02f7d).
-PaseoAgentSendOptions is an alias of SendMessageOptions, so `system` is added
-there only.
+Rebased onto getpaseo/paseo v0.12.0 (cafe4b01c). Finish notification now
+settles on turn_completed while the child is idle, so the external-wait
+label defers that edge. System prompt helpers are imported from
+agent-messages. PaseoAgentSendOptions remains an alias of SendMessageOptions.
 
 ---
 diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
-index d0d057949..f0e767c86 100644
+index 378a0070e..069d26bdd 100644
 --- a/docs/agent-lifecycle.md
 +++ b/docs/agent-lifecycle.md
 @@ -74,6 +74,28 @@ Runtime ownership is resolved from explicit workspace ID and caller context, nev
  Users can also detach an existing subagent from the subagents track. Detach is deliberately a manual lifecycle gesture, not an agent-facing MCP tool. It removes the parent and open-tab lifecycle labels: it does not stop, archive, move, or restart the agent. The agent keeps its current `cwd` and `workspaceId`, leaves the former parent's track, and behaves like a root agent for tab close, workspace activity, and future parent archive.
  
- `notifyOnFinish` defaults to `true` for agent-scoped creation and background prompt follow-ups because most delegated work needs to report back to the creating agent. Set it to `false` only for truly fire-and-forget agents or prompts.
+ `notifyOnFinish` defaults to `true` for agent-scoped creation and prompt follow-ups because most delegated work needs to report back to the creating agent. Set it to `false` only for truly fire-and-forget agents or prompts.
 +
 +### External waits
 +
@@ -47,10 +48,10 @@ index d0d057949..f0e767c86 100644
  The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
  A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.
 diff --git a/packages/cli/src/commands/agent/send.ts b/packages/cli/src/commands/agent/send.ts
-index aa9b5a24c..8d341c7d3 100644
+index 1f288d4ca..167198935 100644
 --- a/packages/cli/src/commands/agent/send.ts
 +++ b/packages/cli/src/commands/agent/send.ts
-@@ -32,6 +32,7 @@ export interface AgentSendOptions extends CommandOptions {
+@@ -34,6 +34,7 @@ export interface AgentSendOptions extends CommandOptions {
    image?: string[];
    prompt?: string;
    promptFile?: string;
@@ -58,56 +59,56 @@ index aa9b5a24c..8d341c7d3 100644
  }
  
  export function addSendOptions(cmd: Command): Command {
-@@ -41,6 +42,7 @@ export function addSendOptions(cmd: Command): Command {
+@@ -43,6 +44,7 @@ export function addSendOptions(cmd: Command): Command {
      .argument("[prompt]", "The message to send")
      .option("--prompt <text>", "Provide the message inline as a flag")
      .option("--prompt-file <path>", "Read the message from a UTF-8 text file")
 +    .option("--system", "Send as internal system context without a user-message bubble")
      .option("--image <path>", "Attach image(s) to the message", collectMultiple, [])
-     .option("--no-wait", "Return immediately without waiting for completion");
- }
-@@ -192,7 +194,7 @@ export async function runSendCommand(
-       options.image && options.image.length > 0 ? await readImageFiles(options.image) : undefined;
+     .addOption(
+       new Option(
+@@ -204,6 +206,7 @@ export async function runSendCommand(
+     await client.sendAgentMessage(agentIdArg, promptInput, {
+       images,
+       sourceAgentId,
++      system: options.system,
+       activeTurnBehavior: options.behavior ?? (sourceAgentId ? "steer" : "interrupt"),
+     });
  
-     // Send the message
--    await client.sendAgentMessage(agentIdArg, promptInput, { images });
-+    await client.sendAgentMessage(agentIdArg, promptInput, { images, system: options.system });
- 
-     // If --no-wait, return immediately
-     if (options.wait === false) {
 diff --git a/packages/client/src/daemon-client.ts b/packages/client/src/daemon-client.ts
-index 858c61e5b..06bc51d86 100644
+index e0e4d9ddc..e42a3053e 100644
 --- a/packages/client/src/daemon-client.ts
 +++ b/packages/client/src/daemon-client.ts
-@@ -425,6 +425,7 @@ export interface DaemonClientTrace {
- 
+@@ -428,6 +428,7 @@ export interface DaemonClientTrace {
  export interface SendMessageOptions {
+   sourceAgentId?: string;
    messageId?: string;
 +  system?: boolean;
    /** What happens when the agent is mid-turn. The daemon interrupts the turn when omitted. */
    activeTurnBehavior?: ActiveTurnBehavior;
    images?: Array<{ data: string; mimeType: string }>;
-@@ -3448,13 +3449,14 @@ export class DaemonClient {
-     options?: SendMessageOptions,
-   ): Promise<void> {
+@@ -3504,7 +3505,7 @@ export class DaemonClient {
+       throw new Error("Update the Paseo host to send messages with agent provenance.");
+     }
      const requestId = this.createRequestId();
 -    const messageId = options?.messageId ?? crypto.randomUUID();
 +    const messageId = options?.system ? undefined : (options?.messageId ?? crypto.randomUUID());
      const message = SessionInboundMessageSchema.parse({
        type: "send_agent_message_request",
        requestId,
-       agentId,
+@@ -3512,6 +3513,7 @@ export class DaemonClient {
        text,
+       sourceAgentId: options?.sourceAgentId,
        ...(messageId ? { messageId } : {}),
 +      ...(options?.system ? { system: true } : {}),
        ...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),
        ...(options?.images ? { images: options.images } : {}),
        ...(options?.attachments ? { attachments: options.attachments } : {}),
 diff --git a/packages/client/src/index.test.ts b/packages/client/src/index.test.ts
-index 0f60e5267..36cad3b22 100644
+index ce6d4a515..ac3fcd6d3 100644
 --- a/packages/client/src/index.test.ts
 +++ b/packages/client/src/index.test.ts
-@@ -770,6 +770,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
+@@ -825,6 +825,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
    );
    await sendPromise;
  
@@ -184,10 +185,10 @@ index 2bf05950d..1adb935a4 100644
    return getParentAgentIdFromLabels(agent.labels) !== null;
  }
 diff --git a/packages/protocol/src/messages.test.ts b/packages/protocol/src/messages.test.ts
-index 3394c8e15..95c5368f7 100644
+index ca3ab8613..36363ebc7 100644
 --- a/packages/protocol/src/messages.test.ts
 +++ b/packages/protocol/src/messages.test.ts
-@@ -76,6 +76,22 @@ describe("project icon revision compatibility", () => {
+@@ -77,6 +77,22 @@ describe("project icon revision compatibility", () => {
    });
  });
  
@@ -211,10 +212,10 @@ index 3394c8e15..95c5368f7 100644
    test("old-shaped fetch_workspaces_response without project still parses", () => {
      const parsed = SessionOutboundMessageSchema.parse(
 diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
-index afb7776e9..66e11b661 100644
+index a7a2182d9..92abceb06 100644
 --- a/packages/protocol/src/messages.ts
 +++ b/packages/protocol/src/messages.ts
-@@ -1202,6 +1202,7 @@ export const SendAgentMessageSchema = z.object({
+@@ -1209,6 +1209,7 @@ export const SendAgentMessageSchema = z.object({
    agentId: z.string(),
    text: z.string(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
@@ -222,19 +223,19 @@ index afb7776e9..66e11b661 100644
    activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
-@@ -1355,6 +1356,7 @@ export const SendAgentMessageRequestSchema = z.object({
-   agentId: z.string(),
-   text: z.string(),
+@@ -1369,6 +1370,7 @@ export const SendAgentMessageRequestSchema = z.object({
+   /** Opaque sender identity for agent-originated prompts. */
+   sourceAgentId: z.string().min(1).optional(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
 +  system: z.boolean().optional(),
    activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
 diff --git a/packages/server/src/server/agent/agent-prompt.test.ts b/packages/server/src/server/agent/agent-prompt.test.ts
-index 08bd66a79..cb55f077d 100644
+index dcdfdb1cb..ba247fbe8 100644
 --- a/packages/server/src/server/agent/agent-prompt.test.ts
 +++ b/packages/server/src/server/agent/agent-prompt.test.ts
-@@ -5,6 +5,8 @@ import { mkdtempSync, rmSync } from "node:fs";
+@@ -13,6 +13,8 @@ import { mkdtempSync, rmSync } from "node:fs";
  import { tmpdir } from "node:os";
  import { join } from "node:path";
  
@@ -243,7 +244,7 @@ index 08bd66a79..cb55f077d 100644
  import { createTestLogger } from "../../test-utils/test-logger.js";
  import { AgentManager } from "./agent-manager.js";
  import { AgentStorage } from "./agent-storage.js";
-@@ -56,6 +58,7 @@ interface FinishNotificationScenarioOptions {
+@@ -59,6 +61,7 @@ interface FinishNotificationScenarioOptions {
  
  interface FinishNotificationScenario {
    startWatchingChild(): void;
@@ -251,7 +252,7 @@ index 08bd66a79..cb55f077d 100644
    requestChildPermission(requestId?: string): void;
    resolveChildPermission(requestId?: string): void;
    resolveChildPermissionFromState(requestId?: string): void;
-@@ -81,6 +84,7 @@ function createFinishNotificationScenario(
+@@ -84,6 +87,7 @@ function createFinishNotificationScenario(
    Reflect.set(childAgent, "id", "child-agent");
    Reflect.set(childAgent, "lifecycle", "idle");
    Reflect.set(childAgent, "config", { title: "Child Agent" });
@@ -259,7 +260,7 @@ index 08bd66a79..cb55f077d 100644
    Reflect.set(childAgent, "pendingPermissions", new Map());
  
    const callerAgent: ManagedAgent = Object.create(null);
-@@ -138,6 +142,13 @@ function createFinishNotificationScenario(
+@@ -141,6 +145,13 @@ function createFinishNotificationScenario(
    });
  
    return {
@@ -273,7 +274,7 @@ index 08bd66a79..cb55f077d 100644
      startWatchingChild() {
        setupFinishNotification({
          agentManager,
-@@ -409,6 +420,38 @@ test("finish notifications survive repeated permission cycles", async () => {
+@@ -431,6 +442,38 @@ test("finish notifications survive repeated permission cycles", async () => {
    ).toEqual(["needs permission", "needs permission", "finished"]);
  });
  
@@ -313,10 +314,10 @@ index 08bd66a79..cb55f077d 100644
    const scenario = createFinishNotificationScenario({
      childParentAgentId: null,
 diff --git a/packages/server/src/server/agent/agent-prompt.ts b/packages/server/src/server/agent/agent-prompt.ts
-index 0bcd46636..81490d8ef 100644
+index bf6d50480..a973f0235 100644
 --- a/packages/server/src/server/agent/agent-prompt.ts
 +++ b/packages/server/src/server/agent/agent-prompt.ts
-@@ -9,7 +9,10 @@ import type { AgentManager, ManagedAgent } from "./agent-manager.js";
+@@ -10,7 +10,10 @@ import type { AgentManager, ManagedAgent } from "./agent-manager.js";
  import type { AgentStorage } from "./agent-storage.js";
  import { ensureAgentLoaded } from "./agent-loading.js";
  import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
@@ -328,31 +329,37 @@ index 0bcd46636..81490d8ef 100644
  import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
  
  export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
-@@ -542,6 +545,10 @@ export function setupFinishNotification(params: SetupFinishNotificationParams):
-           return;
-         }
-         if (event.agent.lifecycle === "idle" && hasSeenRunning) {
-+          if (getExternalWaitIdFromLabels(event.agent.labels)) {
+@@ -656,8 +659,13 @@ export function setupFinishNotification(params: SetupFinishNotificationParams):
+       if (event.event.type === "turn_completed" || event.event.type === "turn_canceled") {
+         // Replacing a turn keeps the child running through the displaced turn's
+         // cancellation. The task settles only when the child becomes idle.
+-        if (agentManager.getAgent(childAgentId)?.lifecycle !== "idle") return;
++        const childAgent = agentManager.getAgent(childAgentId);
++        if (childAgent?.lifecycle !== "idle") return;
+         if (event.event.type === "turn_completed" && hasSeenRunning) {
++          if (getExternalWaitIdFromLabels(childAgent.labels)) {
 +            hasSeenRunning = false;
 +            return;
 +          }
            notifySafely("finished");
-           return;
-         }
+         } else if (event.event.type === "turn_canceled" && hasSeenTurn) {
+           notifySafely("was canceled");
 diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
-index d57333da0..dd9f78523 100644
+index 08d3f0eef..c17c48cad 100644
 --- a/packages/server/src/server/session.ts
 +++ b/packages/server/src/server/session.ts
-@@ -58,6 +58,8 @@ import {
+@@ -58,6 +58,10 @@ import {
+   toAgentPersistenceHandle,
  } from "./persistence-hooks.js";
  import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
- import {
++import {
 +  formatSystemNotificationPrompt,
 +  isSystemInjectedEnvelope,
++} from "./agent/agent-messages/index.js";
+ import {
    sendPromptToAgent,
    waitForAgentRunStartWithTimeout,
-   unarchiveAgentState,
-@@ -8072,11 +8074,15 @@ export class Session {
+@@ -8187,11 +8191,15 @@ export class Session {
      try {
        const agentId = resolved.agentId;
  
@@ -370,10 +377,10 @@ index d57333da0..dd9f78523 100644
            activeTurnBehavior: msg.activeTurnBehavior,
            textPrefix: msg.text.slice(0, 80),
          },
-@@ -8088,7 +8094,7 @@ export class Session {
-           agentStorage: this.agentStorage,
-           agentId,
-           prompt,
+@@ -8206,7 +8214,7 @@ export class Session {
+           source: msg.sourceAgentId
+             ? { kind: "agent-message", agentId: msg.sourceAgentId }
+             : undefined,
 -          messageId: msg.messageId,
 +          messageId: msg.system ? undefined : msg.messageId,
            activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",

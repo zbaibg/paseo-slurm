@@ -1,20 +1,21 @@
 From: zbai29 <zbai29@wisc.edu>
-Date: Thu, 15 Oct 2026 20:00:00 +0000
+Date: Tue, 20 Oct 2026 15:00:00 +0000
 Subject: [PATCH] Launch bare 1M Claude catalog ids with [1m] on a gateway
 
 Claude Code budgets a bare catalog id at 200k when ANTHROPIC_BASE_URL is not
 the official API. Append [1m] only for a gateway, and only when that bare id
 already has a 1M window and is not its own distinct [1m] catalog row.
 
-Rebased onto getpaseo/paseo v0.11.4 (dc5b02f7d). Includes Haiku 5.5.
+Rebased onto getpaseo/paseo v0.12.0 (cafe4b01c). Includes Haiku 5.5 and
+Mythos 5.1.
 
 ---
 diff --git a/packages/server/src/server/agent/providers/claude/agent.ts b/packages/server/src/server/agent/providers/claude/agent.ts
-index b797ce2c9..0dbcb6618 100644
+index 2af8983de..67c740508 100644
 --- a/packages/server/src/server/agent/providers/claude/agent.ts
 +++ b/packages/server/src/server/agent/providers/claude/agent.ts
 @@ -34,11 +34,13 @@ import {
-   findClaudeModel,
+   getClaudeContextWindowMaxTokens,
    getClaudeModelsWithSettings,
    normalizeClaudeRuntimeModelId,
 +  readClaudeSettingsAnthropicBaseUrl,
@@ -27,7 +28,7 @@ index b797ce2c9..0dbcb6618 100644
    parseClaudeCodeVersion,
    resolveClaudeDisabledThinkingForModel,
  } from "./model-manifest.js";
-@@ -2496,8 +2498,10 @@ class ClaudeAgentSession implements AgentSession {
+@@ -2636,8 +2638,10 @@ class ClaudeAgentSession implements AgentSession {
    async setModel(modelId: string | null): Promise<void> {
      const normalizedModelId =
        typeof modelId === "string" && modelId.trim().length > 0 ? modelId.trim() : null;
@@ -39,7 +40,7 @@ index b797ce2c9..0dbcb6618 100644
      this.config.model = normalizedModelId ?? undefined;
      this.reconcileThinkingOptionForModel(normalizedModelId);
      if (!claudeModelSupportsFastMode(this.config.model) && this.config.featureValues?.fast_mode) {
-@@ -3345,6 +3349,16 @@ class ClaudeAgentSession implements AgentSession {
+@@ -3496,6 +3500,16 @@ class ClaudeAgentSession implements AgentSession {
      });
    }
  
@@ -56,7 +57,7 @@ index b797ce2c9..0dbcb6618 100644
    private async buildOptions(permissionMode: PermissionMode): Promise<ClaudeOptions> {
      const { thinking, effort, ultracode } = this.resolveThinkingConfig();
      const appendedSystemPrompt = this.buildAppendedSystemPrompt();
-@@ -3421,10 +3435,11 @@ class ClaudeAgentSession implements AgentSession {
+@@ -3572,10 +3586,11 @@ class ClaudeAgentSession implements AgentSession {
        base.mcpServers = this.normalizeMcpServers(this.config.mcpServers);
      }
  
@@ -71,10 +72,10 @@ index b797ce2c9..0dbcb6618 100644
        base.resume = this.claudeSessionId;
      }
 diff --git a/packages/server/src/server/agent/providers/claude/model-manifest.ts b/packages/server/src/server/agent/providers/claude/model-manifest.ts
-index 398fcb1cc..3bfd27815 100644
+index 45a544110..512f46e76 100644
 --- a/packages/server/src/server/agent/providers/claude/model-manifest.ts
 +++ b/packages/server/src/server/agent/providers/claude/model-manifest.ts
-@@ -34,6 +34,10 @@ export const CLAUDE_DEFAULT_THINKING_OPTION_ID = "high";
+@@ -35,6 +35,10 @@ export const CLAUDE_DEFAULT_THINKING_OPTION_ID = "high";
  export const CLAUDE_DISABLED_THINKING_OPTION_ID = "off";
  export const CLAUDE_ULTRACODE_THINKING_OPTION_ID = "ultracode";
  
@@ -85,7 +86,7 @@ index 398fcb1cc..3bfd27815 100644
  export const CLAUDE_MODEL_MANIFEST = [
    {
      id: "claude-opus-5-5",
-@@ -331,6 +335,51 @@ export function isClaudeManifestModelId(modelId: string): boolean {
+@@ -347,6 +351,51 @@ export function isClaudeManifestModelId(modelId: string): boolean {
    return CLAUDE_MODEL_MANIFEST.some((model) => model.id === modelId);
  }
  
@@ -138,10 +139,10 @@ index 398fcb1cc..3bfd27815 100644
    const normalizedModelId = normalizeClaudeManifestModelId(modelId);
    if (!normalizedModelId) {
 diff --git a/packages/server/src/server/agent/providers/claude/models.test.ts b/packages/server/src/server/agent/providers/claude/models.test.ts
-index ed7db8841..e4fee027d 100644
+index 0daa5e533..1094ac247 100644
 --- a/packages/server/src/server/agent/providers/claude/models.test.ts
 +++ b/packages/server/src/server/agent/providers/claude/models.test.ts
-@@ -8,12 +8,19 @@ import { ClaudeAgentClient } from "./agent.js";
+@@ -8,6 +8,8 @@ import { ClaudeAgentClient } from "./agent.js";
  import {
    CLAUDE_DISABLED_THINKING_OPTION_ID,
    CLAUDE_ULTRACODE_THINKING_OPTION_ID,
@@ -150,19 +151,15 @@ index ed7db8841..e4fee027d 100644
    claudeManifestModelSupportsFastMode,
    normalizeClaudeManifestModelId,
    parseClaudeCodeVersion,
-   resolveClaudeDisabledThinkingForModel,
- } from "./model-manifest.js";
--import { findClaudeModel, getClaudeModels, normalizeClaudeRuntimeModelId } from "./models.js";
-+import {
-+  findClaudeModel,
-+  getClaudeModels,
-+  normalizeClaudeRuntimeModelId,
+@@ -20,6 +22,7 @@ import {
+   getClaudeContextWindowMaxTokens,
+   getClaudeModels,
+   normalizeClaudeRuntimeModelId,
 +  readClaudeSettingsAnthropicBaseUrl,
-+} from "./models.js";
+ } from "./models.js";
  
- const createdClaudeConfigDirs: string[] = [];
- 
-@@ -620,6 +627,44 @@ describe("Claude Opus 5.5 catalog", () => {
+ describe("getClaudeContextWindowMaxTokens", () => {
+@@ -792,6 +795,45 @@ describe("Claude Opus 5.5 catalog", () => {
      ).toEqual(["medium"]);
    });
  
@@ -177,6 +174,7 @@ index ed7db8841..e4fee027d 100644
 +    for (const modelId of [
 +      "claude-opus-5-5",
 +      "claude-opus-5",
++      "claude-mythos-5-1",
 +      "claude-fable-5",
 +      "claude-fable-5-1",
 +      "claude-sonnet-5-5",
@@ -208,7 +206,7 @@ index ed7db8841..e4fee027d 100644
      expect(findClaudeModel("claude-opus-5-5[1m]")?.id).toBe("claude-opus-5-5");
      expect(findClaudeModel("claude-opus-5-5-20260401")?.id).toBe("claude-opus-5-5");
 diff --git a/packages/server/src/server/agent/providers/claude/models.ts b/packages/server/src/server/agent/providers/claude/models.ts
-index 6b341fa9e..43c938b30 100644
+index 2a9b801fd..dfaaccd01 100644
 --- a/packages/server/src/server/agent/providers/claude/models.ts
 +++ b/packages/server/src/server/agent/providers/claude/models.ts
 @@ -1,8 +1,10 @@
@@ -222,7 +220,7 @@ index 6b341fa9e..43c938b30 100644
  import {
    getClaudeCustomModelThinkingOptions,
    getClaudeManifestModels,
-@@ -141,6 +143,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
+@@ -154,6 +156,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
    return typeof value === "object" && value !== null && !Array.isArray(value);
  }
  

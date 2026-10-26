@@ -1,20 +1,18 @@
 From: zbai29 <zbai29@wisc.edu>
-Date: Thu, 15 Oct 2026 20:00:00 +0000
+Date: Tue, 20 Oct 2026 15:00:00 +0000
 Subject: [PATCH] Add paseo send --system for external-wait resumes
 
 Incremental on top of the finish-deferral companion patch. Vanilla checkouts
 should apply external-wait-finish-deferral.patch instead (it already includes
 this).
 
-Rebased onto getpaseo/paseo v0.11.4 (dc5b02f7d) plus finish deferral.
-PaseoAgentSendOptions is now an alias of SendMessageOptions, so the system
-flag lives only on that interface.
+Rebased onto getpaseo/paseo v0.12.0 (cafe4b01c) plus finish deferral.
 
 ---
 diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
 --- a/docs/agent-lifecycle.md
 +++ b/docs/agent-lifecycle.md
-@@ -96,6 +96,9 @@ The label marks an external controller's ownership; Paseo does not interpret the
+@@ -98,6 +98,9 @@ The label marks an external controller's ownership; Paseo does not interpret the
  the external system, group membership, or completion strategy. The controller must serialize its
  state transitions and completion prompts. Errors and permission requests still notify the caller
  immediately. Clearing the label while the child is idle does not itself complete the delegated task.
@@ -25,10 +23,10 @@ diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
  The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
  A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.
 diff --git a/packages/cli/src/commands/agent/send.ts b/packages/cli/src/commands/agent/send.ts
-index aa9b5a24c..8d341c7d3 100644
+index 1f288d4ca..167198935 100644
 --- a/packages/cli/src/commands/agent/send.ts
 +++ b/packages/cli/src/commands/agent/send.ts
-@@ -32,6 +32,7 @@ export interface AgentSendOptions extends CommandOptions {
+@@ -34,6 +34,7 @@ export interface AgentSendOptions extends CommandOptions {
    image?: string[];
    prompt?: string;
    promptFile?: string;
@@ -36,56 +34,56 @@ index aa9b5a24c..8d341c7d3 100644
  }
  
  export function addSendOptions(cmd: Command): Command {
-@@ -41,6 +42,7 @@ export function addSendOptions(cmd: Command): Command {
+@@ -43,6 +44,7 @@ export function addSendOptions(cmd: Command): Command {
      .argument("[prompt]", "The message to send")
      .option("--prompt <text>", "Provide the message inline as a flag")
      .option("--prompt-file <path>", "Read the message from a UTF-8 text file")
 +    .option("--system", "Send as internal system context without a user-message bubble")
      .option("--image <path>", "Attach image(s) to the message", collectMultiple, [])
-     .option("--no-wait", "Return immediately without waiting for completion");
- }
-@@ -192,7 +194,7 @@ export async function runSendCommand(
-       options.image && options.image.length > 0 ? await readImageFiles(options.image) : undefined;
+     .addOption(
+       new Option(
+@@ -204,6 +206,7 @@ export async function runSendCommand(
+     await client.sendAgentMessage(agentIdArg, promptInput, {
+       images,
+       sourceAgentId,
++      system: options.system,
+       activeTurnBehavior: options.behavior ?? (sourceAgentId ? "steer" : "interrupt"),
+     });
  
-     // Send the message
--    await client.sendAgentMessage(agentIdArg, promptInput, { images });
-+    await client.sendAgentMessage(agentIdArg, promptInput, { images, system: options.system });
- 
-     // If --no-wait, return immediately
-     if (options.wait === false) {
 diff --git a/packages/client/src/daemon-client.ts b/packages/client/src/daemon-client.ts
-index 858c61e5b..06bc51d86 100644
+index e0e4d9ddc..e42a3053e 100644
 --- a/packages/client/src/daemon-client.ts
 +++ b/packages/client/src/daemon-client.ts
-@@ -425,6 +425,7 @@ export interface DaemonClientTrace {
- 
+@@ -428,6 +428,7 @@ export interface DaemonClientTrace {
  export interface SendMessageOptions {
+   sourceAgentId?: string;
    messageId?: string;
 +  system?: boolean;
    /** What happens when the agent is mid-turn. The daemon interrupts the turn when omitted. */
    activeTurnBehavior?: ActiveTurnBehavior;
    images?: Array<{ data: string; mimeType: string }>;
-@@ -3448,13 +3449,14 @@ export class DaemonClient {
-     options?: SendMessageOptions,
-   ): Promise<void> {
+@@ -3504,7 +3505,7 @@ export class DaemonClient {
+       throw new Error("Update the Paseo host to send messages with agent provenance.");
+     }
      const requestId = this.createRequestId();
 -    const messageId = options?.messageId ?? crypto.randomUUID();
 +    const messageId = options?.system ? undefined : (options?.messageId ?? crypto.randomUUID());
      const message = SessionInboundMessageSchema.parse({
        type: "send_agent_message_request",
        requestId,
-       agentId,
+@@ -3512,6 +3513,7 @@ export class DaemonClient {
        text,
+       sourceAgentId: options?.sourceAgentId,
        ...(messageId ? { messageId } : {}),
 +      ...(options?.system ? { system: true } : {}),
        ...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),
        ...(options?.images ? { images: options.images } : {}),
        ...(options?.attachments ? { attachments: options.attachments } : {}),
 diff --git a/packages/client/src/index.test.ts b/packages/client/src/index.test.ts
-index 0f60e5267..36cad3b22 100644
+index ce6d4a515..ac3fcd6d3 100644
 --- a/packages/client/src/index.test.ts
 +++ b/packages/client/src/index.test.ts
-@@ -770,6 +770,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
+@@ -825,6 +825,28 @@ test("agent handles delegate create, send, timeline refetch, archive, and local
    );
    await sendPromise;
  
@@ -115,10 +113,10 @@ index 0f60e5267..36cad3b22 100644
      messageId: "run-message-sdk",
      activeTurnBehavior: "interrupt",
 diff --git a/packages/protocol/src/messages.test.ts b/packages/protocol/src/messages.test.ts
-index 3394c8e15..95c5368f7 100644
+index ca3ab8613..36363ebc7 100644
 --- a/packages/protocol/src/messages.test.ts
 +++ b/packages/protocol/src/messages.test.ts
-@@ -76,6 +76,22 @@ describe("project icon revision compatibility", () => {
+@@ -77,6 +77,22 @@ describe("project icon revision compatibility", () => {
    });
  });
  
@@ -142,10 +140,10 @@ index 3394c8e15..95c5368f7 100644
    test("old-shaped fetch_workspaces_response without project still parses", () => {
      const parsed = SessionOutboundMessageSchema.parse(
 diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
-index afb7776e9..66e11b661 100644
+index a7a2182d9..92abceb06 100644
 --- a/packages/protocol/src/messages.ts
 +++ b/packages/protocol/src/messages.ts
-@@ -1202,6 +1202,7 @@ export const SendAgentMessageSchema = z.object({
+@@ -1209,6 +1209,7 @@ export const SendAgentMessageSchema = z.object({
    agentId: z.string(),
    text: z.string(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
@@ -153,28 +151,30 @@ index afb7776e9..66e11b661 100644
    activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
-@@ -1355,6 +1356,7 @@ export const SendAgentMessageRequestSchema = z.object({
-   agentId: z.string(),
-   text: z.string(),
+@@ -1369,6 +1370,7 @@ export const SendAgentMessageRequestSchema = z.object({
+   /** Opaque sender identity for agent-originated prompts. */
+   sourceAgentId: z.string().min(1).optional(),
    messageId: z.string().optional(), // Client-provided ID for deduplication
 +  system: z.boolean().optional(),
    activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
    images: z.array(ImageAttachmentSchema).optional(),
    attachments: AgentAttachmentsSchema,
 diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
-index d57333da0..dd9f78523 100644
+index 08d3f0eef..c17c48cad 100644
 --- a/packages/server/src/server/session.ts
 +++ b/packages/server/src/server/session.ts
-@@ -58,6 +58,8 @@ import {
+@@ -58,6 +58,10 @@ import {
+   toAgentPersistenceHandle,
  } from "./persistence-hooks.js";
  import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
- import {
++import {
 +  formatSystemNotificationPrompt,
 +  isSystemInjectedEnvelope,
++} from "./agent/agent-messages/index.js";
+ import {
    sendPromptToAgent,
    waitForAgentRunStartWithTimeout,
-   unarchiveAgentState,
-@@ -8072,11 +8074,15 @@ export class Session {
+@@ -8187,11 +8191,15 @@ export class Session {
      try {
        const agentId = resolved.agentId;
  
@@ -192,10 +192,10 @@ index d57333da0..dd9f78523 100644
            activeTurnBehavior: msg.activeTurnBehavior,
            textPrefix: msg.text.slice(0, 80),
          },
-@@ -8088,7 +8094,7 @@ export class Session {
-           agentStorage: this.agentStorage,
-           agentId,
-           prompt,
+@@ -8206,7 +8214,7 @@ export class Session {
+           source: msg.sourceAgentId
+             ? { kind: "agent-message", agentId: msg.sourceAgentId }
+             : undefined,
 -          messageId: msg.messageId,
 +          messageId: msg.system ? undefined : msg.messageId,
            activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",

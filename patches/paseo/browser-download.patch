@@ -1,8 +1,18 @@
+From: zbai29 <zbai29@wisc.edu>
+Date: Tue, 20 Oct 2026 15:00:00 +0000
+Subject: [PATCH] Add a daemon-side browser_download tool
+
+Fetch a URL inside a Paseo browser tab and write the checked bytes on the
+daemon host. The desktop client is unchanged.
+
+Rebased onto getpaseo/paseo v0.12.0 (cafe4b01c).
+
+---
 diff --git a/packages/server/src/server/agent/mcp-server.test.ts b/packages/server/src/server/agent/mcp-server.test.ts
-index dbe0885..59b0f14 100644
+index 6e093a18a..dbe75a092 100644
 --- a/packages/server/src/server/agent/mcp-server.test.ts
 +++ b/packages/server/src/server/agent/mcp-server.test.ts
-@@ -890,8 +890,21 @@ describe("browser MCP tools", () => {
+@@ -981,8 +981,21 @@ describe("browser MCP tools", () => {
  
        const listedTools = await client.listTools();
        expect(listedTools.tools.map((tool) => tool.name)).toEqual(
@@ -25,7 +35,7 @@ index dbe0885..59b0f14 100644
        for (const tool of listedTools.tools) {
          expect(tool, `${tool.name} outputSchema`).not.toHaveProperty("outputSchema");
        }
-@@ -999,6 +1012,7 @@ describe("browser MCP tools", () => {
+@@ -1090,6 +1103,7 @@ describe("browser MCP tools", () => {
  
        expect(toolNames).not.toContain("browser_list_tabs");
        expect(toolNames).not.toContain("browser_snapshot");
@@ -34,10 +44,10 @@ index dbe0885..59b0f14 100644
      } finally {
        await client.close();
 diff --git a/packages/server/src/server/agent/tools/paseo-tools.ts b/packages/server/src/server/agent/tools/paseo-tools.ts
-index 07f9f21..2de68a3 100644
+index 34a8d5ebe..db45c15bd 100644
 --- a/packages/server/src/server/agent/tools/paseo-tools.ts
 +++ b/packages/server/src/server/agent/tools/paseo-tools.ts
-@@ -89,6 +89,11 @@ import {
+@@ -97,6 +97,11 @@ import {
    createPaseoWorktreeCommand,
  } from "../../worktree/commands.js";
  import { registerBrowserTools } from "../../browser-tools/tools.js";
@@ -47,9 +57,9 @@ index 07f9f21..2de68a3 100644
 +} from "../../browser-tools/download.js";
 +import { loadPersistedConfig } from "../../persisted-config.js";
  import type { BrowserToolsBroker } from "../../browser-tools/broker.js";
- import type {
-   PaseoToolCatalog,
-@@ -1231,6 +1236,13 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
+ import {
+   PaseoToolInputError,
+@@ -1317,6 +1322,13 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
        callerAgentId,
        resolveCallerAgent,
      });
@@ -63,7 +73,7 @@ index 07f9f21..2de68a3 100644
    }
  
    registerTool(
-@@ -3256,3 +3268,24 @@ function archiveWorktreeDependencies(
+@@ -3347,3 +3359,24 @@ function archiveWorktreeDependencies(
      sessionLogger: context.logger,
    };
  }
@@ -90,7 +100,7 @@ index 07f9f21..2de68a3 100644
 +}
 diff --git a/packages/server/src/server/browser-tools/download.test.ts b/packages/server/src/server/browser-tools/download.test.ts
 new file mode 100644
-index 0000000..fa5a8a2
+index 000000000..fa5a8a264
 --- /dev/null
 +++ b/packages/server/src/server/browser-tools/download.test.ts
 @@ -0,0 +1,671 @@
@@ -767,7 +777,7 @@ index 0000000..fa5a8a2
 +});
 diff --git a/packages/server/src/server/browser-tools/download.ts b/packages/server/src/server/browser-tools/download.ts
 new file mode 100644
-index 0000000..8312d5b
+index 000000000..8312d5b7c
 --- /dev/null
 +++ b/packages/server/src/server/browser-tools/download.ts
 @@ -0,0 +1,1080 @@

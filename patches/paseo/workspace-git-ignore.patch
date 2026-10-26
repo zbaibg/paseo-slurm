@@ -7,6 +7,7 @@ CLI, and watcher work. The spawn backstop lives in the server wrapper around
 the plugin process launcher.
 
 Rebased onto getpaseo/paseo v0.11.4 (dc5b02f7d).
+Applies unchanged to v0.12.0 (cafe4b01c).
 
 ---
 diff --git a/packages/server/src/server/bootstrap.ts b/packages/server/src/server/bootstrap.ts
